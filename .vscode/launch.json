@@ -1,0 +1,40 @@
+{
+  // B-17: SWD debugging with a CMSIS-DAP probe (e.g. Raspberry Pi Debug Probe)
+  // and the Raspberry Pi OpenOCD fork. Requires the Cortex-Debug extension
+  // (installed with the Raspberry Pi Pico extension).
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Pico Debug (extension toolchain)",
+      "type": "cortex-debug",
+      "request": "launch",
+      "cwd": "${workspaceFolder}",
+      "executable": "${command:cmake.launchTargetPath}",
+      "servertype": "openocd",
+      "serverpath": "${userHome}/.pico-sdk/openocd/0.12.0+dev/openocd.exe",
+      "searchDir": ["${userHome}/.pico-sdk/openocd/0.12.0+dev/scripts"],
+      "gdbPath": "${userHome}/.pico-sdk/toolchain/14_2_Rel1/bin/arm-none-eabi-gdb.exe",
+      "device": "RP2350",
+      "configFiles": ["interface/cmsis-dap.cfg", "target/rp2350.cfg"],
+      "openOCDLaunchCommands": ["adapter speed 5000"],
+      "svdFile": "${workspaceFolder}/lib/pico-sdk/src/rp2350/hardware_regs/RP2350.svd",
+      "runToEntryPoint": "main",
+      "postRestartCommands": ["break main", "continue"]
+    },
+    {
+      "name": "Pico Debug (manual setup, tools on PATH)",
+      "type": "cortex-debug",
+      "request": "launch",
+      "cwd": "${workspaceFolder}",
+      "executable": "${workspaceFolder}/build/debug/firmware.elf",
+      "servertype": "openocd",
+      "serverpath": "openocd",
+      "gdbPath": "arm-none-eabi-gdb",
+      "device": "RP2350",
+      "configFiles": ["interface/cmsis-dap.cfg", "target/rp2350.cfg"],
+      "openOCDLaunchCommands": ["adapter speed 5000"],
+      "svdFile": "${workspaceFolder}/lib/pico-sdk/src/rp2350/hardware_regs/RP2350.svd",
+      "runToEntryPoint": "main"
+    }
+  ]
+}

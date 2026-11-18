@@ -1,0 +1,7 @@
+{
+  "cmake.useCMakePresets": "always",
+  "cmake.configureOnOpen": false,
+  "C_Cpp.default.compileCommands": "${workspaceFolder}/build/release/compile_commands.json",
+  "files.eol": "\n",
+  "files.associations": { "*.pio": "pio" }
+}
