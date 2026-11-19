@@ -1,5 +1,11 @@
 # Task: independent code verification of usbdfc
 
+> **Round 1 (areas 1–3) is complete** (findings F1–F11, fixed in
+> `69e2796`; see docs/REQUIREMENTS.md section 8b). Round 2 is split into
+> `docs/VERIFY_PROMPT_A.md` and `docs/VERIFY_PROMPT_B.md`. To run it, see
+> `docs/VERIFY_SESSIONS.md`. This file remains the full reference list of
+> areas.
+
 You are reviewing firmware written by another model. Treat its comments,
 commit messages and docs/REQUIREMENTS.md section 8a ("Implementation
 assumptions") as claims to verify, not as facts. Verify each claim against

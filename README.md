@@ -19,7 +19,7 @@ tests pass (`tests/host/`). **Nothing has run on hardware yet.**
 | Document | Contents |
 |---|---|
 | [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) | Requirements (Rev 3.0-draft). Section 8a lists every assumption made during implementation. Section 9 is the verification plan. |
-| [docs/VERIFY_PROMPT.md](docs/VERIFY_PROMPT.md) | Instructions for an independent code review |
+| [docs/VERIFY_PROMPT.md](docs/VERIFY_PROMPT.md) | Instructions for an independent code review (round 1). Round 2: [VERIFY_SESSIONS.md](docs/VERIFY_SESSIONS.md) |
 | [docs/PROVENANCE.md](docs/PROVENANCE.md) | Origin of the copied magnetometer code, and how upstream changes are tracked |
 | [tests/host/README.md](tests/host/README.md) | Tests that need no hardware |
 
