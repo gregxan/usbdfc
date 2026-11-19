@@ -34,7 +34,7 @@ Firmware for a Seeed XIAO RP2350 that:
 
 ## 4. Execution model (amendments)
 
-- **HW-8 (replaced).** Core 0 runs the magnetometer, the application and the
+- **HW-8 (replaced; detail in section 4.1).** Core 0 runs the magnetometer, the application and the
   native USB device. Core 1 is dedicated to the PIO-USB host: the frame
   handler (SOF alarm interrupt) and the TinyUSB host task. Core 1 handles no
   interrupts other than its SOF alarm, and its stack and hot data live in
@@ -45,10 +45,95 @@ Firmware for a Seeed XIAO RP2350 that:
   abort, then the tick, then native USB.
 - **EX-10 (amended).** The epoch runs at a fixed phase after the tick (about
   tick + 500 µs), after the M-8 publish deadline. *TBD by measurement.*
-- **IC-1 (new).** Core 0 and core 1 exchange data through a lock-free
-  single-producer, single-consumer record ring. No hardware spinlocks are
-  used in the data path. The depth is 2 and the policy is drop-oldest, with
-  every drop counted.
+- **IC-1 (new).** Core 0 hands records to core 1 through a triple-buffer
+  mailbox:
+  - **Slots.** Three record slots. Core 0 always writes into a slot that is
+    neither the published newest nor the one core 1 is reading, then
+    publishes it as the newest. Core 1 always takes the newest.
+  - **Never blocks.** Neither side ever waits for the other, and the
+    freshest record always wins. A record overwritten before core 1 took it
+    shows up as a sequence-number gap and is counted by core 1 (records
+    overwritten).
+  - **Memory access.** Plain aligned 32-bit loads and stores with memory
+    barriers (DMB). No hardware spinlocks are used. Cross-core atomic
+    read-modify-write (exclusive load/store) is used only if verified on the
+    RP2350.
+- **IC-2 (new).** Core 1 notices new records by polling, in a tight loop:
+  check the mailbox, queue any new record with `tuh_cdc_write()` and
+  `tuh_cdc_write_flush()`, call `tuh_task()`, increment its loop
+  heartbeat, and repeat.
+- **IC-3 (new; amends D-2 for core 1).** Every counter has exactly one
+  writing core. Core 1's counters are cumulative and are never cleared. Core
+  0 reads them as aligned 32-bit words and reports differences between
+  snapshots. Core 0's own counters keep D-2's atomic read-and-clear.
+
+### 4.1 Core 1 (USB host core)
+
+- **C1-1. What runs.** Core 1 runs only:
+  - the SOF alarm interrupt, which calls `pio_usb_host_frame()` (USBH-S4).
+    This is the only interrupt enabled in core 1's NVIC;
+  - the IC-2 thread loop.
+
+  All of it runs from RAM (B-18).
+- **C1-2. SOF timing.** While the host port is active:
+  - **Interval.** The interval from one SOF to the next shall be
+    1000 µs ± 0.5 µs, the USB 2.0 full-speed frame-interval tolerance,
+    measured on the bus.
+  - **No gaps.** SOF shall never stop for 3 ms or more while a device is
+    attached. That is how long an idle bus takes to send a device into
+    suspend.
+- **C1-3. Frame handler budget.** The whole frame handler (SOF, all
+  transactions, and event handling) shall take at most 300 µs per frame.
+  *(TBD by measurement.)* Its maximum is recorded (section 7).
+- **C1-4. Thread deadlines.**
+  - A record published by core 0 shall be queued with TinyUSB within
+    50 µs, and before SOF minus the USBH-T3 margin. *(TBD by
+    measurement.)*
+  - The thread may block only inside TinyUSB's own enumeration delays
+    (USBH-3). It never blocks while streaming.
+- **C1-5. Phase.** Provisionally, the epoch runs at tick + 500 µs and SOF at
+  tick + 600 µs. The final values are set with the output period (D20),
+  after measurement.
+- **C1-6. Memory.** Core 1's stack is in SCRATCH_X, the SDK default for core 1.
+  Its size is set from `-fstack-usage` (B-23). Pico-PIO-USB's and TinyUSB's
+  host buffers go in SCRATCH_X if they fit, otherwise in main SRAM.
+- **C1-7. Liveness and watchdog (amends D-5).** Core 0 feeds the hardware
+  watchdog once per epoch. It feeds it only if all three are true:
+  - core 0's own epoch has run;
+  - core 1's SOF counter has advanced since the last check;
+  - core 1's loop heartbeat has advanced within the last 1 s. This allows
+    for TinyUSB's blocking enumeration delays.
+
+  Further rules:
+  - **Timeout.** The watchdog timeout is 1.5 s. *(TBD.)* It is enabled only
+    after start-up (C1-8) has finished, so the blocking magnetometer
+    start-up (M-2) cannot trip it.
+  - **D-5 exception.** A watchdog reset is the single automatic recovery
+    action permitted. It is classed as recovery, not normal operation.
+  - **Persistent count.** On every boot, firmware checks whether the
+    watchdog caused the reboot. If it did, a watchdog-reset counter, kept in
+    the watchdog scratch registers, is incremented. The counter survives the
+    reset, is cleared at power-on, and is reported. A reset loop is visible
+    through it.
+  - **VBUS during reset.** The VBUS switch enable shall default to off
+    (pulled down) while the chip is in reset. The downstream device then
+    sees a clean detach and re-attach.
+  - **Expected gap.** About 1 s after a watchdog reset: the magnetometer
+    restarts (M-2) and the device re-enumerates (USBH-3).
+  - **Debugging.** The watchdog and timers keep the RP2350 default of
+    pausing while a debugger halts a core.
+- **C1-8. Start-up order.**
+  1. Core 0 sets `clk_sys` to 120 MHz (R-3), handles the watchdog-reset
+     check (C1-7), and starts the magnetometer tick, so the timer grid
+     exists. If native USB is enabled, it also runs `tud_init()`.
+  2. Core 0 launches core 1. Core 1 calls `tuh_configure()` and
+     `tuh_init(1)`, claiming the fixed USB DMA channel (USBH-S3), then
+     starts the SOF alarm on the tick grid plus the C1-5 offset.
+  3. Core 0 initialises the magnetometer. Its DMA claims come after step 2.
+  4. Core 0 enables the watchdog and enters the main loop.
+- **C1-9. Debugging.** Timing verification shall use free-running builds
+  only. Halting a core under SWD stops SOF, so the device suspends. That is
+  expected while debugging.
 - **R-3 (replaced).** `clk_sys` shall be 120 MHz, set at build time. This is
   within the RP2350's 150 MHz rating and is the clock most widely used with
   Pico-PIO-USB. Its PIO dividers are fractional: 2.5 for TX and 1.25 for RX.
@@ -241,7 +326,12 @@ fields:
 - dropped records
 - ring overflows
 - VBUS overcurrent
-- core 1 frame-handler timing maximum
+- core 1 frame-handler duration maximum, and SOF interval minimum and
+  maximum (C1-2, C1-3)
+- maximum time from mailbox publish to queued (C1-4)
+- records overwritten in the mailbox (IC-1)
+- core 1 SOF counter and loop heartbeat (cumulative; C1-7)
+- watchdog resets (kept across reset in watchdog scratch; C1-7)
 
 ## 8. Open decisions
 
@@ -259,7 +349,15 @@ fields:
 4. Whether native USB also carries the sample stream to a PC.
 5. Whether to extract the magnetometer driver into a module shared with DFC.
 6. D-5: which host retries, STALL clears and re-enumerations count as normal
-   operation.
+   operation. *(Partly closed: USBH-9 covers the TinyUSB and Pico-PIO-USB
+   retries, and C1-7 adds the watchdog-reset exception.)*
+7. *(Closed: IC-1 to IC-3, section 4.1.)* Core 1 execution model:
+   - a triple-buffer mailbox, which core 1 polls in a tight loop;
+   - single-writer counters;
+   - SOF and frame-handler timing budgets;
+   - liveness through a watchdog, fed by core 0 only while both cores make
+     progress;
+   - the start-up order.
 
 ## 9. Verification (to be written)
 
