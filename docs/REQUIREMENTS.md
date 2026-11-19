@@ -346,9 +346,14 @@ schedules the pair and computes H = (S − R) / 2. It does no averaging or
 other filtering. Bandwidth limiting is left to the MMC5983MA's own BW = 00
 filter.
 
-- **M-3 (amended).** Internal Control 1: BW = 00, which is an 8 ms
-  measurement. All other register settings are unchanged. Auto_SR_en stays
-  off (M-3a), and so does continuous mode.
+- **M-3 (amended).** Internal Control 1: BW = 00. All other register
+  settings are unchanged. Auto_SR_en stays off (M-3a), and so does
+  continuous mode. Datasheet figures for BW = 00 (MMC5983MA Rev A,
+  4/3/2019, pp. 2 and 15):
+  - 8 ms measurement time and 100 Hz bandwidth. The BW bits set the length
+    of the decimation filter;
+  - 0.4 mG RMS noise;
+  - a maximum output rate of 50 Hz.
 - **M-20 (new). The 20 ms cycle.** The 1 kHz tick (M-6, M-6a) is kept as
   the schedule grid. Every 20 ticks form one cycle (k = 0 … 19). Two
   transactions run per cycle, both of DFC's read-then-trigger form (M-7)
@@ -390,6 +395,34 @@ filter.
   - **Start-up.** Keep the single RESET → SET conditioning at start-up.
   - **Removed.** The periodic SET/RESET strategy (`g_mag_sr_mode`) and the
     periodic offset calibration, together with their counters (D-1).
+- **M-23 (new). Datasheet limits and bench checks.**
+  - **Rate limit.** The schedule (M-20) runs at the datasheet's limit for
+    BW = 00. That is 100 measurements per second, one every 10 ms. It
+    matches the continuous-mode maximum at BW = 00 (100 Hz, p. 16). Each
+    pair gives one record at 50 Hz, the rated maximum output rate.
+  - **Inconsistency.** The datasheet gives 8 ms per measurement in the BW
+    table but says "10ms per measurement" in its power example (p. 12).
+  - **Check 1, measurement time.** The real BW = 00 measurement time shall
+    be measured, by polling Meas_M_Done after a trigger. The schedule needs
+    it to be at most 9.5 ms, so that S is ready before the tick-10 read.
+    If it is longer, the fallback is BW = 01: a 4 ms measurement, 0.6 mG.
+    The spacing and the 50 Hz cancellation stay the same.
+  - **Check 2, SET/RESET repeatability.** The datasheet gives SET/RESET
+    repeatability as ±1 mG (p. 2), larger than the 0.4 mG noise. If that
+    variation is random from pulse to pulse, pulsing before every
+    measurement adds it to every record. Noise shall be measured in the
+    pair mode, and in a reference mode for comparison: one SET at start-up,
+    then single measurements at 50 Hz. Compare their RMS and Allan
+    deviation before committing to M-20.
+  - **Check 3, supply current.** Current scales with measurement rate. It is
+    450 µA at 7 measurements per second (p. 2), which gives about 6.4 mA
+    typical at 100 per second. Also add 100 SET or RESET pulses per second,
+    drawn from CAP. The 3.3 V rail (USBH-7a) and the CAP capacitor (HW-5a)
+    shall be checked under this load.
+  - **Temperature.** Temperature (TM_T) and field (TM_M) measurements cannot
+    run at the same time (p. 14). The 2 ms gaps in M-20 leave no confirmed
+    slot for TM_T. Whether to report temperature is a record-format
+    decision (F).
 - **M-8 (amended).** Every transaction contains a pulse, so each shall
   complete within 450 µs of its tick. This shall be re-measured at 120 MHz
   (R-3).
