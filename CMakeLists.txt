@@ -43,10 +43,9 @@ if(NOT TARGET tinyusb_pico_pio_usb)
     message(FATAL_ERROR "Pico-PIO-USB not found at ${PICO_PIO_USB_PATH} (git submodule update --init)")
 endif()
 
+option(APP_USB_STATUS "Native-USB diagnostic port (NU-1, diagnostic builds only)" OFF)
 option(APP_TEST_PINS "Drive the test GPIOs D8/D3 (HW-9)" OFF)
 option(APP_STALL_HOOK "V-14 watchdog stall hook" OFF)
-option(MAG_MODE_SINGLE "Single-measurement mode for V-18 (section 8a H2)" OFF)
-set(MAG_R_TICK "10" CACHE STRING "Tick of the R trigger within the cycle (5 only for V-19)")
 
 add_executable(firmware
     src/main.c
@@ -57,6 +56,8 @@ add_executable(firmware
     src/record.c
     src/mailbox.c
     src/usbh.c
+    src/status.c
+    src/usbd_diag.c
 )
 
 pico_generate_pio_header(firmware ${CMAKE_CURRENT_LIST_DIR}/src/i2c_bus_clear.pio)
@@ -77,12 +78,14 @@ target_link_libraries(firmware PRIVATE
     tinyusb_host
     tinyusb_pico_pio_usb
 )
+if(APP_USB_STATUS)
+    target_link_libraries(firmware PRIVATE tinyusb_device pico_unique_id pico_bootrom pico_usb_reset_interface_headers)
+endif()
 
 target_compile_definitions(firmware PRIVATE
+    APP_USB_STATUS=$<BOOL:${APP_USB_STATUS}>
     APP_TEST_PINS=$<BOOL:${APP_TEST_PINS}>
     APP_STALL_HOOK=$<BOOL:${APP_STALL_HOOK}>
-    MAG_MODE_SINGLE=$<BOOL:${MAG_MODE_SINGLE}>
-    MAG_R_TICK=${MAG_R_TICK}u
     # No default alarm pool: nothing here needs it (USBH-S1a rule 5).
     PICO_TIME_DEFAULT_ALARM_POOL_DISABLED=1
 )
@@ -93,8 +96,8 @@ target_link_options(firmware PRIVATE -Wl,--wrap=hcd_event_handler)
 # All code executes from SRAM (also keeps core 1's USB timing free of XIP stalls).
 pico_set_binary_type(firmware copy_to_ram)
 
-# No stdio: native USB is a diagnostic-only CDC device (NU-1, not yet built);
-# GPIO0/1 carry the PIO-USB host.
+# No stdio: native USB is the diagnostic CDC device (NU-1, own descriptors,
+# NU-4), and GPIO0/1 carry the PIO-USB host.
 pico_enable_stdio_uart(firmware 0)
 pico_enable_stdio_usb(firmware 0)
 

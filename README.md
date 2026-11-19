@@ -6,11 +6,15 @@ device. Each record is built from a SET/RESET pair of low-noise (BW = 00)
 measurements, so the sensor's offset is cancelled. The XIAO is the
 **USB host**, on a PIO-USB port.
 
-**Status:** the production firmware builds with the project's strict
-warning set. It has not yet run on hardware. Not yet implemented: the native
-USB diagnostic port (NU-1 to NU-6), the test-target firmware (VE-1) and
-most of the Python tools (section 9.5). The requirements are in
-[docs/REQUIREMENTS.md](docs/REQUIREMENTS.md). Section 8a lists every
+**Status:** everything in the requirements is implemented:
+- the production firmware;
+- the diagnostic build, with a native-USB status and command port;
+- the Pico 2 test-target firmware;
+- the Python verification tools.
+
+All of it builds with the project's strict warning set. Host-side tests pass
+on the PC (`tests/host/`). Nothing has run on hardware yet. The requirements
+are in [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md); section 8a lists every
 assumption made during implementation.
 
 Derived from the DFC firmware (Rev 2.16, dual UART + MMC5983MA). The
@@ -49,7 +53,7 @@ A4-stepping RP2350 (HW-10).
 
 ```
 CMakeLists.txt            build definition
-CMakePresets.json         release / debug / diag / diag-single / diag-spacing5
+CMakePresets.json         release / debug / diag (status port, markers, stall hook)
 cmake/                    toolchain discovery, SDK import, B-25 exceptions
 lib/pico-sdk/             Pico SDK 2.2.0 (with TinyUSB 86ad6e5), submodule
 lib/Pico-PIO-USB/         Pico-PIO-USB fe9133f, submodule
@@ -60,9 +64,12 @@ src/record.[ch]           46-byte record, CRC-16, COBS framing
 src/mailbox.[ch]          core 0 -> core 1 triple-buffer mailbox
 src/usbh.[ch]             core 1: SOF alarm, TinyUSB CDC host, streaming
 src/tusb_config.h         TinyUSB configuration
+src/usbd_diag.[ch]        diag builds: native-USB CDC + reset interface
+src/status.[ch]           diag builds: status lines and commands
 src/diag.[ch], prof.[ch]  counters and timing instrumentation
-tests/host/               host-side test of the record encoder
-tools/rx_decode.py        record decoder and stream checker (V-1)
+test_target/              Pico 2 test-target firmware (VE-1, VE-2)
+tests/host/               no-hardware tests (record encoder, tools)
+tools/                    capture, timing, noise and control tools (9.5)
 docs/                     requirements, provenance
 ```
 
@@ -78,14 +85,40 @@ The output is `build/release/firmware.uf2`. For toolchain installation,
 follow the DFC README; the steps are the same. Initialise the submodules
 recursively: TinyUSB is a submodule of the SDK.
 
-## Host test
+Diagnostic build: `cmake --preset diag && cmake --build --preset diag`.
+Its native USB-C port is a serial port carrying status lines once per
+second. It also accepts commands (`tools/diag_ctl.py`), the 1200-baud
+touch and `picotool reboot -f`.
+
+Test target (Pico 2):
 
 ```bash
-gcc -std=c11 -Wall -Wextra -Werror -Wconversion -Itests/host/stubs -Isrc \
-    -o test_record tests/host/test_record.c src/record.c
-./test_record > frames.txt
-python tools/rx_decode.py --hexfile frames.txt
+cd test_target
+cmake --preset release
+cmake --build --preset release
 ```
+
+Then flash `test_target/build/release/test_target.uf2`.
+
+## Bench wiring for verification
+
+- **Test target USB:** XIAO host header (VBUS, D-, D+, GND) to the
+  Pico 2's USB port.
+- **Test target UART:** Pico 2 GP0 (TX) / GP1 (RX) to a USB-serial
+  adapter, 921600 baud.
+- **Marker:** XIAO D3 to Pico 2 GP2, diag build only.
+- **Coil (V-19):** Pico 2 GP3, through a transistor and series resistor.
+
+Then, for example, the V-1 soak and the V-2/V-3 timing checks:
+
+```bash
+python tools/rx_decode.py --port COM7 --seconds 300 --log raw.txt --csv rec.csv
+python tools/timing_report.py raw.txt --meas-ms 8.0
+```
+
+## Host tests
+
+See [tests/host/README.md](tests/host/README.md).
 
 ## License
 

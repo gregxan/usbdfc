@@ -1,7 +1,7 @@
 /*
  * TinyUSB configuration (USBH-S1, NU-4). Production builds: host only.
- * Diagnostic builds (APP_USB_STATUS = 1) add the native-USB device
- * (section 5.3); not implemented yet, so the device stack stays off.
+ * Diagnostic builds (APP_USB_STATUS = 1) add the native-USB device on root
+ * port 0 (section 5.3): dual-role, device on core 0, host on core 1.
  */
 #ifndef TUSB_CONFIG_H_
 #define TUSB_CONFIG_H_
@@ -55,6 +55,18 @@
 
 /* ------------------------------------------------------ Device (core 0) */
 
-#define CFG_TUD_ENABLED 0 /* NU-1: diagnostic builds only (not yet built) */
+#if APP_USB_STATUS
+#define BOARD_TUD_RHPORT 0
+#define CFG_TUD_ENABLED 1
+#define CFG_TUD_MAX_SPEED OPT_MODE_FULL_SPEED
+#define CFG_TUD_ENDPOINT0_SIZE 64
+#define CFG_TUD_CDC 1
+#define CFG_TUD_CDC_RX_BUFSIZE 64
+#define CFG_TUD_CDC_TX_BUFSIZE 1024 /* one status report (NU-2) */
+#define CFG_TUD_CDC_EP_BUFSIZE 64
+#define CFG_TUD_VENDOR 0 /* the reset interface is an application driver */
+#else
+#define CFG_TUD_ENABLED 0 /* NU-1: production builds have no device stack */
+#endif
 
 #endif /* TUSB_CONFIG_H_ */

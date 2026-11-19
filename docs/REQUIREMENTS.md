@@ -487,6 +487,15 @@ whose SOF follows the record's publication.
   - **picotool.** Its reset requests (`picotool reboot -f`, `load -f`) work.
   - **Before rebooting.** Firmware turns VBUS off (USBH-7), so the
     downstream device sees a clean detach.
+- **NU-7. Commands** (an addition to NU-2). The CDC port also accepts
+  commands, one per line, each acknowledged with `OK` or `ERR`:
+  - `mode pair` / `mode single` (section 8a H2, V-18);
+  - `rtick <1..19>`: the R-trigger tick (V-19 reference: 5);
+  - `stall <0|1|2>` (V-14);
+  - `status`: report now.
+
+  Changes take effect at the next cycle boundary. `tools/diag_ctl.py`
+  sends them.
 - **NU-6. Identity.**
   - **Development.** Diagnostic builds use the Pico SDK's default Raspberry
     Pi VID/PID.
@@ -854,7 +863,7 @@ Any of them can be overturned by amending this section.
 | # | Item | Assumption implemented |
 |---|---|---|
 | H1 | Designated frame | **Defined from the schedule, not from publication.** The designated SOF for cycle N is the SOF at cycle N's tick 0 plus the C1-5 offset (tick 0 + 600 µs). Core 1 computes it from TIMER0, using the cycle start that core 0 publishes once at start-up. A record that is not in the mailbox by its designated SOF is never sent: core 1 discards it and counts a missing slot (USBH-T5). |
-| H2 | Pair against single mode | Pair mode is implemented. A build option, `MAG_MODE_SINGLE` (the `diag-single` preset), does one SET at start-up and then one measurement per cycle, triggered at tick 0 with no pulse. Each single-mode record carries that measurement in `d` (as raw − 131072) with `s` = 0, and sets REC `type` = 2. It exists for the V-18 comparison only. |
+| H2 | Pair against single mode | Pair mode is the default. Single mode is selected at run time: the `mode single` command on the diagnostic port (NU-7), or `g_mag_single` from the debugger. It applies at the next cycle boundary: one SET, then one plain measurement per cycle, triggered at tick 0. Each single-mode record carries that measurement in `d` (as raw − 131072) with `s` = 0, and sets REC `type` = 2. A mode switch makes the next record NO_PRIOR. Run-time switching lets V-18 alternate modes without reflashing. |
 | H3 | Abort and toggle reset | Resolved from source (USBH-T6, section 7.1). |
 | H4 | Cadence with IN data | USBH-T1's ±10 µs applies while bulk IN returns NAK. A frame in which IN returns data is exempt, and its record is counted as late if it completes after its designated frame. |
 | M1 | Mailbox protocol | **Three slots, with a `newest` index and a `reading` index**, each a 32-bit word written by one core only.<br>**Core 0:** writes a slot that is neither `newest` nor `reading`, issues a DMB, then stores `newest`.<br>**Core 1:** loads `newest` and stores it in `reading`, issues a DMB, then re-loads `newest`. If `newest` has changed, it repeats. Otherwise it copies the slot.<br>Each slot carries its `seq`, so a duplicate take is detected. |
@@ -866,7 +875,7 @@ Any of them can be overturned by amending this section.
 | M7 | Test target timing | **The test target is a Pico 2 (RP2350).** It has a DWT cycle counter. VE-1's "8 ns at 125 MHz" becomes "6.7 ns at 150 MHz". |
 | M8 | Real device | It is assumed to behave like the test target in normal mode. |
 | M9 | Re-probe in the cycle | While faulted, the re-probe (M-2a) runs at tick 0 of every tenth cycle, which is 5 Hz. After a successful re-configuration, the pair schedule restarts at the next tick 0, and that record is marked NO_PRIOR. |
-| M10 | Presets | `release` (production), `debug`, and `diag`: native USB status, D3/D8 markers and the V-14 stall hook. `diag-single` adds H2's single mode, and `diag-spacing5` adds V-19's 5 ms spacing. |
+| M10 | Presets | `release` (production), `debug`, and `diag`. `diag` adds the native-USB status and command port, the D3/D8 markers and the V-14 stall hook. Single mode (H2) and V-19's 5 ms spacing (`rtick 5`) are run-time commands, so no further presets are needed. |
 | L1 | `seq` | The cycle in which S was triggered. |
 | L2 | Stale flag | Set by core 0 if the record is more than 30 ms old (from `t_us`) when it is built. |
 | L3 | Watchdog scratch | `scratch[0]` holds a magic value and `scratch[1]` the count. `scratch[4..7]` are left to the SDK's reboot functions. Only watchdog timeouts are counted, not SDK-requested reboots. |
@@ -887,7 +896,7 @@ carried over from DFC). Timing tests use free-running builds (C1-9).
 
 ### 9.1 Equipment
 
-- **VE-1. Test target device.** A Raspberry Pi Pico 2 runs project-supplied
+- **VE-1. Test target device.** *(Implemented in `test_target/`.)* A Raspberry Pi Pico 2 runs project-supplied
   TinyUSB CDC-ACM firmware (`test_target/` in this repository) and acts as
   the downstream device.
   - **Checks it makes.** It checks every frame's COBS framing, CRC
@@ -898,9 +907,36 @@ carried over from DFC). Timing tests use free-running builds (C1-9).
     - each completed bulk OUT packet;
     - each edge on one input wired to the XIAO's D3 test pin.
   - **Forwarding.** It forwards the frames and timestamps to the PC through
-    a UART-to-USB adapter. A command over that UART selects its mode
-    (VE-2).
-- **VE-2. Test target modes.**
+    a UART-to-USB adapter, as text lines on UART0 at 921,600 baud:
+    `H` (header), `S` (SOF), `O` (packet), `M` (marker) and `E` (event).
+    The format is in `test_target/src/main.c` and `tools/target_log.py`.
+    A command over that UART selects its mode (VE-2).
+  - **Pins (Pico 2):**
+    - GP0/GP1: the UART;
+    - GP2: the marker input, from the XIAO's D3;
+    - GP3: the coil drive (VE-4).
+
+    The Pico 2's own USB port connects to the XIAO's 4-pin host header
+    (HW-14).
+  - **Identity.** It uses the pid.codes test VID/PID 0x1209/0x0001, which
+    is reserved for private testing.
+  - **Timestamping.** SOF, OUT completion and bus reset are timestamped in
+    the USB interrupt through `-Wl,--wrap=dcd_event_handler`. "STALL on
+    SET_LINE_CODING" uses `-Wl,--wrap=cdcd_control_xfer_cb`. TinyUSB is not
+    modified.
+- **VE-2. Test target modes** (commands `mode <name> [ms]`, through
+  `tools/target_ctl.py`, or `rx_decode.py --script` during a capture).
+  - **Re-enumeration.** Descriptor modes (`ep32`, `vendor`, `nolinereq`)
+    and `stall_linecoding` and `enumhang` reconnect the device, so the
+    XIAO sees a detach and attach.
+  - **How NAKing works.** NAK modes stop reading the 64-byte CDC FIFO, so
+    the device NAKs from the next packet.
+  - **`enumhang`** stops the device task after the next bus reset, so
+    enumeration control transfers are never completed.
+  - **To validate on hardware:** that the OUT endpoint re-arms after the
+    XIAO clears a STALL.
+
+  The modes:
   - normal;
   - NAK every OUT for a given time (for example 5 ms, 50 ms or 5 s);
   - never ACK;
@@ -1004,8 +1040,8 @@ shall never be disturbed: no missed ticks and no timeouts.
   cycle and NACK, adapted to the 20 ms cycle. Records carry the right
   reason codes, and valid records resume within 40 ms of a single hung
   transaction (M-16a).
-- **V-14. Watchdog.** A diagnostic-build hook stalls core 1, and then
-  separately stalls core 0. A reset follows within the 1.5 s timeout. The
+- **V-14. Watchdog.** A diagnostic-build hook (`stall 2`, then `stall 1`)
+  stalls core 1, and then separately stalls core 0. A reset follows within the 1.5 s timeout. The
   watchdog-reset count survives it, `boot_id` changes, and VBUS drops
   during the reset.
 - **V-15. Detach detection (E9).** On every board used, an unplug is
@@ -1022,7 +1058,8 @@ shall never be disturbed: no missed ticks and no timeouts.
   1,000 measurements, with minimum, typical and maximum recorded. Pass:
   maximum at most 9.5 ms. Otherwise switch to the BW = 01 fallback.
 - **V-18. Noise: pair against single.** Alternate the two modes every
-  minute for 20 minutes at the VE-4 location:
+  minute for 20 minutes at the VE-4 location (`diag_ctl.py --alternate 60
+  --minutes 20`, while `rx_decode.py --csv` captures the records):
   - pair mode;
   - one SET at start-up, then single BW = 00 measurements at 50 Hz.
 
@@ -1031,7 +1068,7 @@ shall never be disturbed: no missed ticks and no timeouts.
 - **V-19. Mains cancellation.** Coil at 50 Hz, then at 60 Hz, then off. Report
   the leakage relative to a reference measurement taken with the pair
   spacing deliberately broken: one pair per cycle, but S and R 5 ms
-  apart, in a diagnostic build. Expected: 50 Hz strongly suppressed, and
+  apart (`rtick 5`, diagnostic build). Expected: 50 Hz strongly suppressed, and
   60 Hz about 20 % leakage (M-21).
 - **V-20. Ground loop and supply.** Noise (as V-18) with the device
   attached and detached (USBH-7a). Check the 3.3 V ripple and the CAP
@@ -1040,9 +1077,16 @@ shall never be disturbed: no missed ticks and no timeouts.
 
 ### 9.5 Tools (Python, Windows)
 
-- `tools/rx_decode.py`: decodes the test target's UART stream, checks
-  COBS, CRC, `seq` and `boot_id`, and writes CSV.
-- `tools/timing_report.py`: interval histograms and pass/fail for
-  V-2 and V-3.
+- `tools/rx_decode.py`: captures the test target's UART stream. It checks
+  COBS, CRC, `seq` and `boot_id` against the V-1 criteria, writes CSV and
+  a raw log, and can send test-target commands on a timed script.
+- `tools/timing_report.py`: V-2 and V-3 pass or fail from a raw log.
+  Whole-frame slips count as late (exempt, USBH-T1).
 - `tools/target_ctl.py`: selects the test-target modes (VE-2).
-- `tools/noise_report.py`: RMS and Allan deviation for V-18 and V-20.
+- `tools/diag_ctl.py`: the XIAO's diagnostic port (NU-2, NU-7). Shows
+  status, sends commands, and alternates pair and single mode for V-18.
+- `tools/noise_report.py`: RMS and Allan deviation for V-18 and V-20,
+  grouped by record type.
+- `tools/target_log.py`: parses the test-target log (shared by the others).
+- `tests/host/`: no-hardware tests of the record encoder and of the tools,
+  on a synthetic log.

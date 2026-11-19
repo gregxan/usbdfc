@@ -28,7 +28,9 @@
 #include "mailbox.h"
 #include "prof.h"
 #include "record.h"
+#include "status.h"
 #include "tick.h"
+#include "usbd_diag.h"
 #include "usbh.h"
 
 /* Section 7.2 persistent and static values (read by the debugger or the
@@ -105,6 +107,8 @@ static void __not_in_flash_func(build_and_publish)(uint64_t cycle) {
     if (reason == REC_REASON_PAIR_INCOMPLETE) {
         diag_inc(DIAG_MAG_PAIR_INCOMPLETE);
     }
+    g_last_reason = (uint32_t)reason;
+    g_last_flags = r.payload[2];
     r.cycle = cycle;
     r.t_pub_us = time_us_64();
     mb_publish(&r);
@@ -165,6 +169,7 @@ int main(void) {
     g_chip_version = rp2350_chip_version();
     s_chip_unsupported = g_chip_version < 4u; /* HW-10: A4 and later */
     tick_init();
+    usbd_diag_init(); /* diagnostic builds: tud_init() before core 1 (USBH-S1a rule 3) */
 
     /* Step 2: core 1 initialises the host, claims its DMA channel, starts
      * SOF, then signals. VBUS on only after that (L4). */
@@ -207,6 +212,14 @@ int main(void) {
         epoch_work(e, now);
         PROF_END(PROF_EPOCH);
         EPOCH_PIN_LOW();
+
+#if APP_USB_STATUS
+        /* NU-3: after the epoch's work, timed separately (D-4). */
+        uint32_t st0 = diag_cycles();
+        usbd_diag_task();
+        status_poll(now);
+        diag_max(DIAG_T_STATUS, diag_cycles() - st0);
+#endif
         e++;
     }
 }

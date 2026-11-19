@@ -45,14 +45,13 @@
 #define ABRT_REASON_BITS 0x0001ffffu
 #define SLOT_NONE 2u
 
-#if MAG_MODE_SINGLE
-#define MAG_PAIR_MODE 0
-#else
-#define MAG_PAIR_MODE 1
-#endif
-
 _Static_assert(MAG_S_TICK < MAG_CYCLE_TICKS && MAG_R_TICK < MAG_CYCLE_TICKS && MAG_S_TICK != MAG_R_TICK,
                "schedule ticks must be distinct and inside the cycle");
+
+/* Section 8a H2 / M10: run-time test modes (diagnostic commands, or the
+ * debugger). Read once per cycle at tick 0; invalid values are ignored. */
+volatile uint32_t g_mag_single = MAG_MODE_SINGLE;
+volatile uint32_t g_mag_r_tick = MAG_R_TICK;
 
 typedef enum {
     MAG_FAULT,    /* product ID not confirmed: re-probe (M-2a)          */
@@ -86,6 +85,7 @@ static uint32_t s_cfg_cmd[CFG_CMD_LEN];
 
 /* Transaction in flight. */
 static volatile uint64_t s_cur_cycle;
+static volatile bool s_cur_single;
 static uint8_t s_rx[MMC_READ_BYTES] __attribute__((aligned(4)));
 
 /* The last completed trigger (M-9, M-10). */
@@ -98,11 +98,19 @@ static uint64_t s_trig_time_us;
 static mag_pair_t s_build;
 static bool s_build_have_s;
 
-/* Command lists for TXN_S and TXN_R. */
+/* Command lists: S with SET, R with RESET, and the plain trigger used in
+ * single mode after its first (SET) transaction. */
 static uint32_t s_cmd_s[I2C_TX_FIFO_DEPTH] __attribute__((aligned(4)));
 static uint32_t s_cmd_r[I2C_TX_FIFO_DEPTH] __attribute__((aligned(4)));
+static uint32_t s_cmd_plain[I2C_TX_FIFO_DEPTH] __attribute__((aligned(4)));
 static uint32_t s_cmd_s_len;
 static uint32_t s_cmd_r_len;
+static uint32_t s_cmd_plain_len;
+
+/* Mode applied for the current cycle (tick ISR only). */
+static bool s_single;
+static bool s_single_need_set; /* entering single mode: SET once first */
+static uint32_t s_r_tick = MAG_R_TICK;
 
 static uint s_dma_cmd;
 static uint s_dma_data;
@@ -261,7 +269,11 @@ static void __not_in_flash_func(start_dma)(mag_txn_t txn, const uint32_t *cmd, u
 /* Start a scheduled measurement transaction (M-20). */
 static void __not_in_flash_func(sample_start)(mag_txn_t txn, uint64_t cycle) {
     s_cur_cycle = cycle;
-    if (txn == TXN_S) {
+    s_cur_single = s_single;
+    if (txn == TXN_S && s_single && !s_single_need_set) {
+        start_dma(TXN_S, s_cmd_plain, s_cmd_plain_len, s_rx, MMC_READ_BYTES);
+    } else if (txn == TXN_S) {
+        s_single_need_set = false;
         start_dma(TXN_S, s_cmd_s, s_cmd_s_len, s_rx, MMC_READ_BYTES);
     } else {
         start_dma(TXN_R, s_cmd_r, s_cmd_r_len, s_rx, MMC_READ_BYTES);
@@ -330,8 +342,7 @@ static void __not_in_flash_func(publish_pair)(const mag_pair_t *p) {
 /* A scheduled transaction completed (STOP_DET, both DMA channels done). */
 static void __not_in_flash_func(sample_done)(uint64_t now_us) {
     uint64_t c = s_cur_cycle;
-    if (s_txn == TXN_S) {
-#if MAG_PAIR_MODE
+    if (s_txn == TXN_S && !s_cur_single) {
         /* Read R of cycle c-1: the pair for c-1 is complete. */
         if (c >= 1u) {
             mag_half_t r = eval_half(TXN_R, c - 1u);
@@ -349,7 +360,7 @@ static void __not_in_flash_func(sample_done)(uint64_t now_us) {
             p.single = false;
             publish_pair(&p);
         }
-#else
+    } else if (s_txn == TXN_S) {
         /* Single mode: read S of cycle c-1. */
         if (c >= 1u) {
             mag_half_t h = eval_half(TXN_S, c - 1u);
@@ -363,7 +374,8 @@ static void __not_in_flash_func(sample_done)(uint64_t now_us) {
             p.t_us = (h == MAG_HALF_NO_PRIOR) ? nominal_tick_us(c - 1u, MAG_S_TICK) : s_trig_time_us;
             publish_pair(&p);
         }
-#endif
+    }
+    if (s_txn == TXN_S) {
         /* This transaction's trigger (S of cycle c) just completed (M-10). */
         s_build_have_s = false;
         s_build.cycle = c;
@@ -465,7 +477,21 @@ void __not_in_flash_func(mag_tick_isr)(uint64_t tick) {
     uint64_t cycle = tick / MAG_CYCLE_TICKS;
     uint32_t k = (uint32_t)(tick % MAG_CYCLE_TICKS);
     bool s_tick = (k == MAG_S_TICK);
-    bool scheduled = s_tick || (MAG_PAIR_MODE && k == MAG_R_TICK);
+    if (s_tick) {
+        /* Apply run-time test modes at the cycle boundary. A mode change
+         * leaves the next half without a matching prior trigger, so that
+         * record is NO_PRIOR (M-9). */
+        bool single = g_mag_single != 0u;
+        if (single && !s_single) {
+            s_single_need_set = true; /* the last pulse may have been RESET */
+        }
+        s_single = single;
+        uint32_t rt = g_mag_r_tick;
+        if (rt != MAG_S_TICK && rt < MAG_CYCLE_TICKS) {
+            s_r_tick = rt;
+        }
+    }
+    bool scheduled = s_tick || (!s_single && k == s_r_tick);
     mag_txn_t next = s_tick ? TXN_S : TXN_R;
     bool sampling = (s_txn == TXN_S || s_txn == TXN_R);
 
@@ -641,14 +667,9 @@ bool mag_init(void) {
     s_cfg_cmd[7] = MMC_CTRL0_RESET;
     s_cfg_cmd[8] = CMD_RESTART | MMC_REG_CTRL0;
     s_cfg_cmd[9] = CMD_STOP | MMC_CTRL0_SET;
-#if MAG_PAIR_MODE
     s_cmd_s_len = (uint32_t)build_cmds(s_cmd_s, MMC_CTRL0_SET);
     s_cmd_r_len = (uint32_t)build_cmds(s_cmd_r, MMC_CTRL0_RESET);
-#else
-    s_cmd_s_len = (uint32_t)build_cmds(s_cmd_s, 0u); /* single: no pulses */
-    s_cmd_r_len = s_cmd_s_len;
-    memcpy(s_cmd_r, s_cmd_s, sizeof s_cmd_r);
-#endif
+    s_cmd_plain_len = (uint32_t)build_cmds(s_cmd_plain, 0u);
 
     i2c_hw_t *hw = i2c_regs();
     /* The blocking calls above left IC_TAR = 0x30, which DMA reuses. */

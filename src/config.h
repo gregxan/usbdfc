@@ -54,11 +54,11 @@
 #define MAG_CYCLE_TICKS 20u
 #define MAG_S_TICK 0u /* SET + trigger S at this tick of the cycle */
 #ifndef MAG_R_TICK
-#define MAG_R_TICK 10u /* RESET + trigger R; 5 only for V-19 (diag-spacing5) */
+#define MAG_R_TICK 10u /* RESET + trigger R; "rtick 5" for the V-19 reference */
 #endif
 
-/* Section 8a H2: single-measurement mode for the V-18 noise comparison
- * (diag-single only). One SET at start-up, one measurement per cycle. */
+/* Section 8a H2: start-up value of the run-time single-measurement mode
+ * (g_mag_single, V-18). Switched by the diagnostic command "mode". */
 #ifndef MAG_MODE_SINGLE
 #define MAG_MODE_SINGLE 0
 #endif
@@ -134,8 +134,13 @@
 #define DIAG_TIMING 1
 #endif
 
+/* NU-1: native-USB diagnostic port (diagnostic presets only). */
+#ifndef APP_USB_STATUS
+#define APP_USB_STATUS 0
+#endif
+
 /* V-14 hook (diag builds): writing 1 or 2 to g_diag_stall_core stalls
- * core 0 or core 1 so the watchdog fires. */
+ * core 0 or core 1 so the watchdog fires ("stall 1" / "stall 2"). */
 #ifndef APP_STALL_HOOK
 #define APP_STALL_HOOK 0
 #endif

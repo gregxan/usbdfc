@@ -63,6 +63,14 @@ static inline uint32_t mag_raw18(const uint8_t raw[MMC_SAMPLE_BYTES], unsigned a
            (((uint32_t)raw[6] >> shift) & 3u);
 }
 
+/* Section 8a H2 / M10 run-time test modes, applied at the next cycle
+ * boundary: g_mag_single = 1 selects single-measurement mode (one SET,
+ * then one plain measurement per cycle at tick 0, V-18); g_mag_r_tick
+ * moves the R trigger (5 for the V-19 reference; default MAG_R_TICK).
+ * Set by diagnostic commands (status.c) or from the debugger. */
+extern volatile uint32_t g_mag_single;
+extern volatile uint32_t g_mag_r_tick;
+
 /* Called from the 1 ms tick ISR only (core 0). */
 void mag_tick_isr(uint64_t tick_index);
 

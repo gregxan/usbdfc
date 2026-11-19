@@ -28,28 +28,14 @@
     },
     {
       "name": "diag",
-      "displayName": "Diagnostic: D8/D3 markers, V-14 stall hook",
+      "displayName": "Diagnostic: native-USB status port, D8/D3 markers, V-14 hook",
       "inherits": "base",
-      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release", "APP_TEST_PINS": "ON", "APP_STALL_HOOK": "ON" }
-    },
-    {
-      "name": "diag-single",
-      "displayName": "Diagnostic: single-measurement mode (V-18)",
-      "inherits": "diag",
-      "cacheVariables": { "MAG_MODE_SINGLE": "ON" }
-    },
-    {
-      "name": "diag-spacing5",
-      "displayName": "Diagnostic: S and R 5 ms apart (V-19 reference)",
-      "inherits": "diag",
-      "cacheVariables": { "MAG_R_TICK": "5" }
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release", "APP_USB_STATUS": "ON", "APP_TEST_PINS": "ON", "APP_STALL_HOOK": "ON" }
     }
   ],
   "buildPresets": [
     { "name": "release", "configurePreset": "release" },
     { "name": "debug", "configurePreset": "debug" },
-    { "name": "diag", "configurePreset": "diag" },
-    { "name": "diag-single", "configurePreset": "diag-single" },
-    { "name": "diag-spacing5", "configurePreset": "diag-spacing5" }
+    { "name": "diag", "configurePreset": "diag" }
   ]
 }
