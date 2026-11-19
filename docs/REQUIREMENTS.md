@@ -26,6 +26,31 @@ Firmware for a Seeed XIAO RP2350 that:
 - **Diagnostics (D-1 … D-6).** Kept, minus the UART items, plus the USB
   host counters.
 
+### 2.1 Code taken from DFC
+
+- **B-26. Copy once, with a recorded baseline.**
+  - **Source.** usbdfc takes its magnetometer and support code from DFC Rev
+    2.16 (commit `addc417`) as a one-time copy. It is not shared code: the
+    copy is then adapted freely.
+  - **Files:**
+    - `mag.c`, `mag.h`, `mmc5983ma.h`, `i2c_bus_clear.pio`;
+    - `tick.c` and `tick.h`, with the UART bookkeeping (U-8) and the call
+      into `link` removed;
+    - `diag.c`, `diag.h`, `prof.c`, `prof.h`;
+    - the relevant parts of `config.h`.
+
+    The DFC verification procedures for the magnetometer (V-5a, V-6) are
+    the starting point for usbdfc's.
+  - **Provenance file.** `docs/PROVENANCE.md` lists each copied file with
+    its DFC source path and the baseline commit. It also records the last
+    DFC commit that was reviewed.
+  - **Porting.** When DFC changes one of the baseline files, the change is
+    reviewed and either ported (noting the DFC commit) or recorded as not
+    applicable, with the reason. The review commit in `docs/PROVENANCE.md`
+    is then advanced.
+  - **Licence.** Copied code is licensed 0BSD in usbdfc (LICENSE). Both
+    repositories have the same owner.
+
 ## 3. Removed from DFC Rev 2.16
 
 - HW-2, HW-3, HW-6, HW-6a (UART pins).
@@ -753,7 +778,9 @@ TX DMA completions (D-3a).
    - BOOTSEL reboot by the 1200-baud touch and picotool's reset interface;
    - SDK default VID/PID for now, with a Raspberry Pi PID required before
      distribution.
-5. Whether to extract the magnetometer driver into a module shared with DFC.
+5. *(Closed: B-26.)* The magnetometer driver is copied once from DFC
+   `addc417`, adapted, and tracked by hand through `docs/PROVENANCE.md`.
+   It is not a shared module.
 6. *(Closed: section 7.)* Recovery and counters:
    - halted endpoints are cleared, at most once per second;
    - a stuck record is aborted after 20 ms;
