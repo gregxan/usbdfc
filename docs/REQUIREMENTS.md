@@ -36,8 +36,8 @@ Firmware for a Seeed XIAO RP2350 that:
 
 ## 4. Execution model (amendments)
 
-- **HW-8 (replaced; detail in section 4.1).** Core 0 runs the magnetometer, the application and the
-  native USB device. Core 1 is dedicated to the PIO-USB host: the frame
+- **HW-8 (replaced; detail in section 4.1).** Core 0 runs the magnetometer and the application,
+  and, in diagnostic builds only, the native USB device (section 5.3). Core 1 is dedicated to the PIO-USB host: the frame
   handler (SOF alarm interrupt) and the TinyUSB host task. Core 1 handles no
   interrupts other than its SOF alarm, and its stack and hot data live in
   SCRATCH_X/Y.
@@ -234,25 +234,50 @@ Firmware for a Seeed XIAO RP2350 that:
     transaction up to 3 times, on later frames, before reporting an error.
     This is also normal operation under D-5. Each error reported is
     counted.
-- **B-19 / B-20 (rewritten).** Native USB is a CDC device to a PC, for
-  status and flashing. It may stay enabled in production.
+- **B-19 / B-20 (rewritten).** The native USB port is a CDC device to a PC
+  in diagnostic builds only. Production builds leave the native USB
+  controller unused (section 5.3).
 
 ### 5.0 Stack and resources
 
 - **USBH-S1.** The host stack is TinyUSB's host core, with `cdc_host` (ACM
   only) and the `hcd_pio_usb` port driver, running on Pico-PIO-USB.
-  - **Root ports.** TinyUSB runs in dual-role mode. Root port 0 is the
-    native USB device, served by `tud_task()` on core 0. Root port 1 is the
-    PIO-USB host (`CFG_TUH_RPI_PIO_USB = 1`), served by `tuh_task()` on
-    core 1.
+  - **Root ports.**
+    - **Production builds:** host only. `CFG_TUD_ENABLED = 0`, so no device
+      stack is linked. Root port 1 is the PIO-USB host
+      (`CFG_TUH_RPI_PIO_USB = 1`), served by `tuh_task()` on core 1.
+    - **Diagnostic builds:** dual-role. Root port 0 is the native USB device,
+      served by `tud_task()` on core 0 (section 5.3), and root port 1 is the
+      host, as in production.
   - **Class options.** `CFG_TUH_CDC_FTDI`, `CFG_TUH_CDC_CP210X` and
     `CFG_TUH_CDC_CH34X` are 0, and `CFG_TUH_HUB` is 0.
   - **Write path.** Only core 1 calls `tuh_cdc_write()` and
     `tuh_cdc_write_flush()`, taking records from the IC-1 ring.
-- **USBH-S1a.** *(Verification item.)* TinyUSB's shared core code is used
-  from two cores at once: device on core 0, host on core 1. Its
-  thread-safety across cores shall be reviewed and tested. If it is unsafe,
-  the fallback is to drop the native USB device from production builds.
+- **USBH-S1a. Dual-role safety (diagnostic builds only).** TinyUSB has no
+  cross-core locking. In a bare-metal build its only lock masks that
+  stack's own interrupt on the calling core, and the PIO-USB host's lock is
+  empty. Its device and host halves keep separate state. Dual-role use is
+  safe only under these rules:
+  1. All device-side calls, `tud_init()`, `tud_task()` and the native USB
+     interrupt stay on core 0.
+  2. All host-side calls, `tuh_init()`, `tuh_task()` and the SOF interrupt
+     stay on core 1.
+  3. `tud_init()` completes before core 1 calls `tuh_init()` (C1-8).
+  4. Only the PIO-USB host driver (`hcd_pio_usb`) is linked, not the SDK's
+     native host driver.
+  5. `tusb_time_millis_api()` only reads the timer, and
+     `tusb_time_delay_ms_api()` waits on the timer. Neither uses the SDK
+     alarm pool.
+  6. Data crosses cores only through IC-1 and the single-writer counters
+     (IC-3).
+
+  **Verification.** Review TinyUSB `86ad6e5`'s shared files (`tusb.c`,
+  `usbh.c`, `usbd.c`) for globals touched after initialisation by both
+  halves. Then soak-test a diagnostic build with status output and host
+  streaming running together, for the V-1 duration.
+
+  **Fallback.** If a diagnostic build fails, it uses SWD for status instead.
+  Production builds are unaffected.
 - **USBH-S2.** Versions (B-9):
   - **TinyUSB:** the copy bundled with Pico SDK 2.2.0, commit `86ad6e5`.
   - **Pico-PIO-USB:** a git submodule at `lib/Pico-PIO-USB`, pinned to
@@ -282,6 +307,53 @@ Firmware for a Seeed XIAO RP2350 that:
   the image is held to B-22 … B-24. Exceptions are listed file by file, with
   a written justification. The list is to be filled in after the first
   build and reviewed whenever USBH-S2 changes.
+
+### 5.3 Native USB (diagnostic builds only)
+
+- **NU-1. Builds.** The native USB device exists only in diagnostic presets
+  (B-7). Production presets have no device stack, no `USBCTRL_IRQ` and no
+  `tud_task()`. They are flashed from BOOTSEL entered with the BOOT button,
+  which the ROM's own USB handles without any firmware.
+- **NU-2. Content.**
+  - **What it sends.** Human-readable status lines, one set per second:
+    - every counter in section 7, including the watchdog-reset count;
+    - the timing maxima (C1-2 to C1-4, D-4, D-6);
+    - the fault flags;
+    - the latest record's validity and reason.
+  - **Never blocks.** A line is written only when the CDC buffer has room
+    for all of it, as DFC's status reporter does.
+  - **No data mirror.** The binary data records are not mirrored to this
+    port.
+- **NU-3. Timing on core 0.**
+  - **Interrupt.** `USBCTRL_IRQ` has the lowest priority (EX-5).
+  - **Task.** `tud_task()` and the status writer run once per epoch, after
+    the application work. Their time is excluded from the epoch measurement
+    and recorded as a separate maximum (D-4).
+  - **Bounds.** The native USB interrupt is bounded by EX-4.
+- **NU-4. Implementation.** `pico_stdio_usb` is not used, because it
+  supplies its own TinyUSB configuration and descriptors, which cannot also
+  enable the host. The project provides:
+  - its own `tusb_config.h` (USBH-S1);
+  - device descriptors;
+  - the CDC status writer, which calls `tud_cdc_write()` and uses no
+    `printf`.
+- **NU-5. Reboot into BOOTSEL without the button.**
+  - **Interfaces.** The device is composite: the CDC interface (with an
+    Interface Association Descriptor) plus the vendor reset interface
+    defined by the Pico SDK (`pico/usb_reset_interface.h`).
+  - **1200-baud touch.** Setting the line coding to 1,200 baud reboots into
+    BOOTSEL.
+  - **picotool.** Its reset requests (`picotool reboot -f`, `load -f`) work.
+  - **Before rebooting.** Firmware turns VBUS off (USBH-7), so the
+    downstream device sees a clean detach.
+- **NU-6. Identity.**
+  - **Development.** Diagnostic builds use the Pico SDK's default Raspberry
+    Pi VID/PID.
+  - **Strings.** The serial-number string is the RP2350 flash unique ID.
+    The product string identifies a usbdfc diagnostic build.
+  - **Release gate.** Before any units are distributed, a dedicated product
+    ID shall be obtained from Raspberry Pi, which offers them for RP2040 and
+    RP2350 products. NU-6 shall then be updated.
 
 ### 5.1 Output timing
 
@@ -512,7 +584,12 @@ filter.
    with `cdc_host` on Pico-PIO-USB `fe9133f`. `clk_sys` is 120 MHz, and
    D+/D- are on GPIO0/1. Accepting TinyUSB amended USBH-3, USBH-4, USBH-4a
    and USBH-9 to match its behaviour.
-4. Whether native USB also carries the sample stream to a PC.
+4. *(Closed: section 5.3.)* Native USB:
+   - diagnostic builds only;
+   - status text only, with no data mirror;
+   - BOOTSEL reboot by the 1200-baud touch and picotool's reset interface;
+   - SDK default VID/PID for now, with a Raspberry Pi PID required before
+     distribution.
 5. Whether to extract the magnetometer driver into a module shared with DFC.
 6. D-5: which host retries, STALL clears and re-enumerations count as normal
    operation. *(Partly closed: USBH-9 covers the TinyUSB and Pico-PIO-USB
