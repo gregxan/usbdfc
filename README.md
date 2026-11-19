@@ -30,14 +30,14 @@ tests pass (`tests/host/`). **Nothing has run on hardware yet.**
   - **Magnetometer.** Two DMA-driven I2C transactions per 20 ms cycle:
     - at tick 0: read R, then a SET pulse, then trigger S;
     - at tick 10: read S, then a RESET pulse, then trigger R.
-  - **Records.** Work runs in 1 ms epochs at tick + 500 µs. At each cycle's
+  - **Records.** Work runs in 1 ms epochs at tick + 750 µs. At each cycle's
     tick 0, the epoch builds the previous cycle's 46-byte record and hands
     it to core 1 through a triple-buffer mailbox.
   - **Housekeeping.** Core 0 also drives the VBUS switch, counts
     overcurrent and feeds the watchdog.
 - **Core 1:**
   - TinyUSB host with its CDC-ACM driver, on Pico-PIO-USB;
-  - SOF generated from a second TIMER0 alarm at tick + 600 µs, so the bus
+  - SOF generated from a second TIMER0 alarm at tick + 850 µs, so the bus
     stays phase-locked to the magnetometer;
   - each record COBS-framed and sent in one 48-byte bulk OUT.
 - **Native USB-C port:**

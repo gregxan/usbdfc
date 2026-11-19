@@ -70,8 +70,9 @@ Firmware for a Seeed XIAO RP2350 that:
   magnetometer data. It is also the only producer into the inter-core mailbox (IC-1).
 - **EX-5 (amended).** The priority order is: magnetometer completion and
   abort, then the tick, then native USB.
-- **EX-10 (amended).** The epoch runs at a fixed phase after the tick (about
-  tick + 500 µs), after the M-8 publish deadline. *TBD by measurement.*
+- **EX-10 (amended).** The epoch runs at a fixed phase after the tick,
+  tick + 750 µs, after the M-8 publish deadline (650 µs). *TBD by
+  measurement.*
 - **IC-1 (new).** Core 0 hands records to core 1 through a triple-buffer
   mailbox:
   - **Slots.** Three record slots. Core 0 always writes into a slot that is
@@ -118,10 +119,17 @@ Firmware for a Seeed XIAO RP2350 that:
     measurement.)*
   - The thread may block only inside TinyUSB's own enumeration delays
     (USBH-3). It never blocks while streaming.
-- **C1-5. Phase.** Epochs run every 1 ms at tick + 500 µs. SOF runs every
-  1 ms at tick + 600 µs. The record for each cycle is published in the epoch
-  of cycle tick 0 (M-20) and goes out on that tick's SOF. Both offsets are
-  provisional until measured.
+- **C1-5. Phase.** Epochs run every 1 ms at tick + 750 µs. SOF runs every
+  1 ms at tick + 850 µs. The record for each cycle is published in the epoch
+  of cycle tick 0 (M-20) and goes out on that tick's SOF.
+  - **Why these values** (review finding F2). The tick-0 transaction is
+    estimated at 445–520 µs. The original 500 µs epoch could therefore run
+    before the pair it needs was published, and the record would have gone
+    out as PAIR_INCOMPLETE.
+  - **Freshness.** USBH-T4's age is about 2000 µs + the SOF offset − the
+    transaction time, so about 2.4 ms. The SOF offset may rise to about
+    1.4 ms before the 3 ms limit is reached.
+  - **Provisional.** Both offsets are provisional until measured (V-4).
 - **C1-6. Memory.** Core 1's stack is in SCRATCH_X, the SDK default for core 1.
   Its size is set from `-fstack-usage` (B-23). Pico-PIO-USB's and TinyUSB's
   host buffers go in SCRATCH_X if they fit, otherwise in main SRAM.
@@ -192,8 +200,12 @@ Firmware for a Seeed XIAO RP2350 that:
     shall complete within 1 s of attach. *(To be confirmed by measurement.)*
   - **Timeout.** TinyUSB has no control-transfer timeout, so the
     application shall add one. If a device that has attached is not ready
-    to stream within 2 s, the enumeration-failure counter is incremented
-    and USBH-9 applies.
+    to stream within 2 s of its attach event, the enumeration-timeout
+    counter is incremented and USBH-9 applies. The 2 s are measured from the
+    attach event, which the frame handler timestamps. They are not measured
+    from the thread loop: TinyUSB's 500 ms of reset and debounce delays run
+    in that loop (F8). A device found unsupported is not also counted as a
+    timeout (F7).
 - **USBH-4.** After SET_CONFIGURATION, the host shall send, in TinyUSB's
   order:
   1. SET_CONTROL_LINE_STATE with DTR = 1 and RTS = 1
@@ -253,10 +265,18 @@ Firmware for a Seeed XIAO RP2350 that:
   - **No further action** in either case: no VBUS cycling, no bus reset, no
     re-enumeration until detach. A new attach starts a new enumeration.
     That is a new event, not a retry, so it is normal operation under D-5.
-  - **Transfer errors while streaming.** Pico-PIO-USB repeats a failed
-    transaction up to 3 times, on later frames, before reporting an error.
-    This is also normal operation under D-5. Each error reported is
-    counted.
+  - **Transfer errors while streaming** (corrected after review finding F5).
+    - **What Pico-PIO-USB does.** At `fe9133f` it retries only NAKs, on
+      the next frame. A transaction with no valid handshake completes at
+      once with an error (`pio_usb_host.c` `usb_out_transaction`,
+      `usb_in_transaction`).
+    - **What the firmware does.** It resends the failed record once
+      (USBH-T6a) and counts each error.
+    - **Why the resend is safe.** If the device had received the first
+      copy, it discards the resend as a duplicate, because the data toggle
+      is unchanged. So no record is doubled.
+    - **If the resend also fails,** the record is dropped.
+    - **D-5.** This is normal operation.
 - **B-19 / B-20 (rewritten).** The native USB port is a CDC device to a PC
   in diagnostic builds only. Production builds leave the native USB
   controller unused (section 5.3).
@@ -370,26 +390,43 @@ whose SOF follows the record's publication.
   most 3 ms. The record represents the field over the two 8 ms measurement
   windows in M-20.
 - **USBH-T5. What is sent.** Every record core 0 publishes is sent. Invalid
-  records are sent with their reason code (M-9). If core 0 has published
-  nothing new by the designated frame, core 1 sends nothing for that
-  period. The device sees a gap in the sequence numbers, and core 1 counts
-  it as a missing slot.
+  records are sent with their reason code (M-9). If no record for a slot
+  has been queued by its designated frame's SOF, core 1 sends nothing for
+  that period. That covers a record never published, published late, or
+  superseded in the mailbox before core 1 took it.
+  - **Counted.** The device sees a gap in the sequence numbers. Core 1
+    counts the slot as missing, once, by time (F9). A record that arrives
+    after its slot was counted is discarded and not counted again.
 - **USBH-T6. Late records: newest wins.**
   - **One at a time.** Core 1 queues at most one record with TinyUSB at a
     time.
-  - **A NAK or error delays it.** Pico-PIO-USB retries the record on the
-    next frame, automatically (USBH-9).
+  - **A NAK delays it.** Pico-PIO-USB retries a NAK'd record on the next
+    frame, automatically. An error is not retried by the library; see
+    USBH-T6a.
+  - **USBH-T6a. Resend once.** After a transfer error that is not a STALL,
+    core 1 resends the same frame once (F5).
+  - **Flush handling** (review finding F1). TinyUSB accepts a flush only
+    once it has processed the previous transfer's completion in
+    `tuh_task()`. If the flush is not accepted, the frame stays in the CDC
+    FIFO and the flush is retried on every loop.
   - **Newer records wait.** Until the delayed record is sent, newer records
     stay in the mailbox (IC-1), and only the newest survives.
-  - **Stuck records are aborted.** If a record has not been accepted 20 ms
-    (one period) after it was queued, core 1 aborts the transfer, counts the
-    record as aborted, and queues the newest record from the mailbox. A
-    device that recovers therefore receives fresh data, never a stale
-    record. *(Verified: `hcd_edpt_abort_xfer()` calls Pico-PIO-USB's
-    `pio_usb_host_endpoint_abort_transfer()`, which may busy-wait about one
-    frame on core 1 while an in-flight transaction finishes. This is the only
-    permitted block while streaming.)* After an abort, the CDC transmit FIFO
-    is cleared (`tuh_cdc_write_clear()`), so no partial frame is sent.
+  - **Stuck records are dropped.** If a record has not been accepted 20 ms
+    (one period) after it was queued, core 1:
+    - aborts any active transfer;
+    - clears the CDC transmit FIFO and the in-flight state, whether or not
+      a transfer was active (F1);
+    - counts the record as aborted;
+    - queues the newest record from the mailbox.
+
+    A device that recovers therefore receives fresh data, never a stale
+    record. Clearing the FIFO (`tuh_cdc_write_clear()`) also means no
+    partial frame is sent.
+  - **Abort timing.** `hcd_edpt_abort_xfer()` calls Pico-PIO-USB's
+    `pio_usb_host_endpoint_abort_transfer()`. Its one-frame busy-wait loop
+    runs only while `transfer_started` is set, which happens only inside
+    the frame handler on the same core. So it never waits when called from
+    the core 1 thread (verified by review, F10).
   - **Counted.** Late, aborted and overwritten records are counted.
 - **USBH-T7 (requirement on the downstream device).** The device shall accept
   one packet of up to 64 bytes per 20 ms period, continuously.
@@ -658,9 +695,13 @@ filter.
     run at the same time (p. 14). The 2 ms gaps in M-20 leave no confirmed
     slot for TM_T. Whether to report temperature is a record-format
     decision (F).
-- **M-8 (amended).** Every transaction contains a pulse, so each shall
-  complete within 450 µs of its tick. This shall be re-measured at 120 MHz
-  (R-3).
+- **M-8 (amended).** Every transaction contains a pulse: 18 bytes plus
+  START, three RESTARTs and STOP at 400 kHz.
+  - **Estimate.** About 445–520 µs including the SCL rise time (review
+    finding F2). The original 450 µs limit is unlikely to be met.
+  - **Requirement.** Each transaction shall complete within 650 µs of its
+    tick, before the epoch at tick + 750 µs (EX-10, C1-5). To be measured at
+    120 MHz with the final pull-ups and wiring (V-4).
 - **M-16a (amended).** After a single hung transaction, valid records shall
   resume within 2 cycles (40 ms).
 - **M-17 (amended).** A record is stale once it is more than 30 ms old
@@ -687,8 +728,9 @@ below.
   - setting the fault flag on persistent not-ready measurements (M-2b).
 - **Enumeration retries.** TinyUSB repeats each failed enumeration step up
   to 3 times, 100 ms apart (USBH-9).
-- **Transaction retries.** Pico-PIO-USB repeats an errored transaction up to
-  3 times, and a NAK'd one on every frame (USBH-9).
+- **Transaction retries.** Pico-PIO-USB repeats a NAK'd transaction on every
+  frame. It does not retry an errored one; the firmware resends that
+  record once (USBH-9, USBH-T6a).
 - **New attach.** Enumeration on a new attach (USBH-9).
 - **Stuck records.** Aborting a record that is still not accepted after
   20 ms, and moving on to the newest one (USBH-T6).
@@ -750,16 +792,20 @@ change between readings (IC-3).
 
 - **Device:**
   - attaches, detaches;
-  - enumeration failures, enumeration timeouts;
-  - unsupported devices.
+  - enumeration failures: only those the firmware can see, namely a failed
+    configuration-descriptor fetch. TinyUSB gives no callback when its own
+    enumeration gives up, so those appear as enumeration timeouts (F6);
+  - enumeration timeouts;
+  - unsupported devices, counted once each (F7).
 - **Transfers:**
   - transfer errors;
   - STALLs on bulk OUT and on bulk IN;
   - halt clears, and halt clears deferred by the rate limit.
 - **Records:**
   - sent, late, aborted;
-  - overwritten in the mailbox (IC-1);
-  - missing slots (USBH-T5).
+  - overwritten: a pending record replaced by a newer one while one was
+    in flight (USBH-T6);
+  - missing slots: no record queued by the slot's SOF (USBH-T5).
 - **Other:**
   - bytes received on bulk IN and discarded (USBH-4a);
   - the SOF counter and loop heartbeat (C1-7).
@@ -888,6 +934,50 @@ Any of them can be overturned by amending this section.
 | L10 | Test target UART | 921,600 baud. "Never ACK" NAKs only data and status stages; SETUP packets are always acknowledged. |
 | L11 | Lookups | The A4 check uses the SDK's `rp2350_chip_version()`, which decodes the SYSINFO revision (0 = A0, 1 = A1, 2 = A2). Its mapping gives 4 for A4. HW-10 treats `rp2350_chip_version() >= 4` as A4 or later; to be confirmed on an A4 board (V-15). The XIAO's VBUS-to-5V path is still to be checked on the schematic. |
 | L12 | Wording | Core 1 data is in SCRATCH_X only; the mailbox replaces "ring". |
+
+## 8b. Independent review (Rev 3.0-draft)
+
+`docs/VERIFY_PROMPT.md` was run by an independent model on commit
+`9aa35d9`, covering areas 1–3. It found 11 issues. All are resolved in
+code or in this document.
+
+| ID | Finding | Resolution |
+|---|---|---|
+| F1 (High) | A flush TinyUSB did not accept left `s_inflight` set forever; streaming stopped until detach | Flush retried every loop until accepted. A stuck record is dropped even if no transfer is active (USBH-T6) |
+| F2 (High) | The tick-0 transaction (about 445–520 µs) missed M-8 and raced the 500 µs epoch | Epoch at tick + 750 µs and SOF at tick + 850 µs. M-8 amended to 650 µs (C1-5, EX-10, M-8) |
+| F3 | Control-endpoint events during mount counted as phantom `sent` and `late`; a detach left a stale IN error | The wrapper ignores endpoint 0. All events and state are cleared when a stream starts or a device unmounts |
+| F4 | An IN error could leave bulk IN un-armed | IN re-armed every loop until TinyUSB shows the endpoint busy |
+| F5 | Pico-PIO-USB does not retry errored transactions (requirement was wrong) | USBH-9 and section 7.1 corrected. One resend per record (USBH-T6a) |
+| F6 | TinyUSB's own enumeration failures are never counted | Section 7.2 corrected: they appear as timeouts |
+| F7 | A non-CDC device was counted unsupported and as a timeout | Marked unsupported in `tuh_mount_cb` |
+| F8 | The 2 s timeout started about 500 ms late | The attach is timestamped in the event wrapper (USBH-3) |
+| F9 | A never-published record counted as overwritten, not missing | Missing slots counted by time (USBH-T5). Overwritten redefined (section 7.2) |
+| F10 | The abort's busy-wait never runs on the thread (safe) | USBH-T6 note corrected |
+| F11 | Halt-clear state survived a detach; endpoint parsing accepted an interface TinyUSB does not open | State reset on stream start and unmount. Only the interface right after the communication interface is accepted |
+
+Areas 4–10 of the prompt have not yet been reviewed independently.
+
+### 8c. Fact audit (sources of facts this design relies on)
+
+After F5, every fact taken from a web fetch was re-checked against the
+pinned local sources. F5 itself came from Pico-PIO-USB's upstream `main`
+branch, not from `fe9133f`.
+
+| Fact | Source originally used | Status |
+|---|---|---|
+| Pico-PIO-USB retries errored transactions 3 times | Upstream `main` (web) | **Wrong** at `fe9133f`; corrected (F5) |
+| `skip_alarm_pool` still sets `timer_active`; the frame is driven by `pio_usb_host_frame()` | Upstream `main` (web) | Verified at `fe9133f` (`pio_usb_host.c` `start_timer`, `pio_usb_host_frame`) |
+| Frame order: SOF, then endpoints in pool order; a NAK is retried next frame | Upstream `main` (web) | Verified at `fe9133f` |
+| PIO dividers from `clock_get_hz(clk_sys)` / 48 MHz and / 96 MHz | Upstream `main` (web) | Verified at `fe9133f` |
+| DMA claimed with `dma_claim_mask(1 << tx_ch)`; PIO and SM numbers from the configuration | Upstream `main` (web) | Verified at `fe9133f` (`pio_usb.c`, `pio_usb_configuration.h`) |
+| TinyUSB enumeration delays (50 ms, 450 ms, 2 ms) and 3 × 100 ms retries | TinyUSB `86ad6e5` (web, pinned commit) | Verified locally and by review |
+| CDC host: DTR before line coding, only with line-request support; no STALL report to the application | TinyUSB `86ad6e5` (web, pinned commit) | Verified locally and by review |
+| `hcd_edpt_clear_stall()` is a stub; abort is supported | Local source | Verified |
+| RP2350 A4 fixes E9; `rp2350_chip_version()` returns 4 for A4 | Raspberry Pi announcement (web); SDK source | A4 fix: external source. Version mapping inferred from the SDK's decoding; still to be confirmed on an A4 board (V-15) |
+| MMC5983MA timings, noise, rates | Datasheet Rev A (supplied by the user) | Verified against the datasheet; the 8 ms versus 10 ms conflict is open (M-23) |
+| USB 2.0 full-speed SOF interval 1.000 ms ± 0.5 µs; suspend after 3 ms idle | From memory | **Unverified**; check against the USB 2.0 specification |
+| pid.codes test VID/PID 0x1209/0x0001 | From memory | **Unverified**; check against pid.codes before use |
+| DW_apb_i2c SCL period formula used in F2 | Reviewer, from memory | **Unverified**; settled by measurement (V-4) |
 
 ## 9. Verification
 

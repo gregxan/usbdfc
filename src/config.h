@@ -94,11 +94,16 @@
 
 /* --------------------------------------------------- Scheduling (C1-5) */
 
+/* EX-10, C1-5 (amended after review finding F2): the tick-0 transaction
+ * (read 9, SET, TM_M at 400 kHz) takes about 445-520 us, so the epoch that
+ * builds the record runs at tick + 750 us, after it has been published,
+ * and SOF follows at tick + 850 us. Freshness (USBH-T4) is then about
+ * 2.4 ms against the 3 ms limit. Both to be confirmed by measurement (M-8). */
 #ifndef EPOCH_OFFSET_US
-#define EPOCH_OFFSET_US 500u /* EX-10: epoch at tick + 500 us */
+#define EPOCH_OFFSET_US 750u
 #endif
 #ifndef SOF_OFFSET_US
-#define SOF_OFFSET_US 600u /* C1-5: SOF at tick + 600 us */
+#define SOF_OFFSET_US 850u
 #endif
 
 /* ------------------------------------------------------------- USB host */

@@ -8,7 +8,8 @@ What it models (test_target/src/main.c output):
   - SOF every 1000 us, DWT at 150 MHz, starting just before a 32-bit wrap;
   - one record packet per 20 ms at SOF + 30 us; "O" lines are printed
     before the "S" lines that preceded them, as on the target;
-  - an R-trigger marker toggle 10.4 ms after each cycle's tick 0;
+  - SOF at tick + 850 us, and an R-trigger marker toggle at tick 10 +
+    450 us (the end of the tick-10 transaction), as in C1-5 / M-8;
   - field H = (1000, -2000, 300) counts plus Gaussian noise, offset 5;
   - optionally one packet delayed by one frame (--late) and one SOF moved
     by 2 us (--jitter-sof), which the timing report must flag.
@@ -77,7 +78,7 @@ def main():
         pending_sof.append(f"S {cyc(t):08x}")
         k = f % 20
         if k == 10:
-            lines.append(f"M {cyc(t + 400.0 - 600.0 + 10.0):08x} {(f // 20) & 1}")
+            lines.append(f"M {cyc(t + 450.0 - 850.0):08x} {(f // 20) & 1}")
         if k == 0 and f >= 20:
             seq = f // 20 - 1
             delay = 1000.0 if seq == late_cycle else 0.0

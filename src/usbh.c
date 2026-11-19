@@ -16,6 +16,7 @@
 #include "pio_usb.h"
 #include "pio_usb_ll.h"
 #include "tusb.h"
+#include "host/usbh_pvt.h" /* usbh_edpt_busy(); after tusb.h */
 
 #include "config.h"
 #include "diag.h"
@@ -108,6 +109,7 @@ static bool s_stream_start;
 
 /* Set in the frame handler (hcd event, core 1 ISR), consumed by the thread. */
 static volatile bool s_attach_ev;
+static volatile uint32_t s_attach_us32; /* F8: stamped at the attach event */
 static volatile bool s_detach_ev;
 static volatile bool s_out_done;
 static volatile uint8_t s_out_result;
@@ -123,13 +125,16 @@ extern void __real_hcd_event_handler(hcd_event_t const *event, bool in_isr);
 void __not_in_flash_func(__wrap_hcd_event_handler)(hcd_event_t const *event, bool in_isr) {
     switch (event->event_id) {
     case HCD_EVENT_DEVICE_ATTACH:
+        s_attach_us32 = time_us_32(); /* USBH-3: the timeout runs from here */
         s_attach_ev = true;
         break;
     case HCD_EVENT_DEVICE_REMOVE:
         s_detach_ev = true;
         break;
     case HCD_EVENT_XFER_COMPLETE:
-        if (s_daddr != 0u && event->dev_addr == s_daddr) {
+        /* F3: endpoint 0 (control) never matches the bulk endpoints, even
+         * before they are known (s_ep_out/s_ep_in still 0). */
+        if (s_daddr != 0u && event->dev_addr == s_daddr && (event->xfer_complete.ep_addr & 0x7fu) != 0u) {
             uint8_t ep = event->xfer_complete.ep_addr;
             uint8_t res = event->xfer_complete.result;
             if (ep == s_ep_out) {
@@ -174,7 +179,13 @@ static bool parse_endpoints(const uint8_t *d, uint32_t len) {
             }
             if (num == s_comm_itf) {
                 after_comm = true;
-            } else if (after_comm && cls == TUSB_CLASS_CDC_DATA) {
+            } else if (after_comm) {
+                /* F11: TinyUSB opens only the interface that immediately
+                 * follows the communication interface, and only if it is
+                 * CDC data (cdc_host.c open_ep_stream_pair). */
+                if (cls != TUSB_CLASS_CDC_DATA) {
+                    break;
+                }
                 in_data = true;
             }
         } else if (type == TUSB_DESC_ENDPOINT && blen >= 7u && in_data) {
@@ -201,12 +212,27 @@ static bool parse_endpoints(const uint8_t *d, uint32_t len) {
     return true;
 }
 
-static void reset_stream(void) {
-    s_stream_start = true;
-}
-
 static bool s_inflight;
 static bool s_pending;
+static bool s_flush_pending; /* F1: written to the FIFO, flush not yet accepted */
+static bool s_in_rearm;      /* F4: bulk IN must be re-armed               */
+static bool s_have_seq;
+static void halt_state_reset(void);
+
+/* Start a stream (new mount): forget every event and state left over from
+ * enumeration or from a previous device (F3, F11). */
+static void reset_stream(void) {
+    s_stream_start = true;
+    s_inflight = false;
+    s_pending = false;
+    s_flush_pending = false;
+    s_in_rearm = false;
+    s_have_seq = false;
+    s_out_done = false;
+    s_in_stall_ev = false;
+    s_in_err_ev = false;
+    halt_state_reset();
+}
 
 static void cfg_desc_cb(tuh_xfer_t *xfer) {
     if (s_st != ST_CHECKING) {
@@ -218,8 +244,6 @@ static void cfg_desc_cb(tuh_xfer_t *xfer) {
         return;
     }
     if (parse_endpoints(s_cfg_buf, xfer->actual_len)) {
-        s_inflight = false;
-        s_pending = false;
         reset_stream();
         __dmb();
         s_st = ST_STREAMING;
@@ -253,21 +277,28 @@ void tuh_cdc_umount_cb(uint8_t idx) {
     if (idx == s_cdc_idx) {
         s_st = ST_NONE;
         s_daddr = 0u;
-        s_inflight = false;
-        s_pending = false;
+        reset_stream(); /* F11: also clears halt-clear state */
     }
 }
 
 /* Every device, after configuration (USBH-9): anything that did not mount
- * as a full-speed CDC-ACM function is unsupported. */
+ * as a full-speed CDC-ACM function is unsupported. F7: it is marked
+ * unsupported, so the enumeration timeout is not counted for it too. */
 void tuh_mount_cb(uint8_t daddr) {
     if (s_st == ST_NONE || s_daddr != daddr) {
         INC(unsupported);
+        if (s_st == ST_NONE) {
+            s_st = ST_UNSUPPORTED;
+        }
     }
 }
 
 void tuh_umount_cb(uint8_t daddr) {
     (void)daddr;
+    if (s_st == ST_UNSUPPORTED) {
+        s_st = ST_NONE; /* the unsupported device has gone */
+        s_daddr = 0u;
+    }
 }
 
 /* ============================================ Halt clear (sec. 7.1) === */
@@ -282,6 +313,18 @@ static uint64_t s_last_clear_out;
 static uint64_t s_last_clear_in;
 static bool s_have_clear_out;
 static bool s_have_clear_in;
+
+/* F11: on a new stream or a detach, no clear is pending or rate-limited,
+ * and no control transfer to a departed device is outstanding. */
+static void halt_state_reset(void) {
+    s_ctrl_busy = false;
+    s_clear_req_out = false;
+    s_clear_req_in = false;
+    s_clear_deferred_out = false;
+    s_clear_deferred_in = false;
+    s_have_clear_out = false;
+    s_have_clear_in = false;
+}
 
 /* Pico-PIO-USB's hcd_edpt_clear_stall() is a stub, so reset the data
  * toggle of that endpoint in its public pool (relies on fe9133f). */
@@ -300,8 +343,7 @@ static void clear_cb(tuh_xfer_t *xfer) {
         reset_toggle(xfer->daddr, ep);
         INC(halt_clears);
         if (ep == s_ep_in) {
-            uint8_t dummy;
-            (void)tuh_cdc_read(s_cdc_idx, &dummy, 0u); /* re-arm bulk IN */
+            s_in_rearm = true; /* F4: re-armed from the thread loop */
         }
     } else {
         INC(xfer_errors);
@@ -371,31 +413,71 @@ static void halt_poll(uint64_t now) {
 static mb_rec_t s_pend_rec;
 static uint64_t s_inflight_t;
 static uint64_t s_inflight_frame;
-static bool s_have_seq;
-static uint64_t s_last_seq;
+static uint64_t s_last_seq; /* newest cycle accounted for: sent, queued or missing */
+
+/* F5: the frame in flight, kept for one resend after a transfer error. */
+static uint8_t s_tx_frame[REC_FRAME_LEN];
+static size_t s_tx_len;
+static bool s_tx_resent;
 
 /* Designated frame for record cycle c: tick 0 of cycle c + 1 (section 8a H1). */
 static inline uint64_t designated_frame(uint64_t cycle) {
     return (cycle + 1u) * MAG_CYCLE_TICKS + MAG_S_TICK;
 }
 
-static void queue_record(mb_rec_t *r, uint64_t now) {
-    uint8_t frame[REC_FRAME_LEN];
-    size_t n = rec_finalize(frame, r->payload, s_stream_start);
+static inline uint64_t designated_sof_us(uint64_t cycle) {
+    return s_sof_t0 + designated_frame(cycle) * TICK_PERIOD_US;
+}
+
+/* F1: start the transfer if TinyUSB will take it now. If the endpoint is
+ * still busy (its completion not yet processed by tuh_task()), leave the
+ * frame in the FIFO and retry on the next loop. If the FIFO is already
+ * empty, the CDC driver sent it on its own from its completion handler. */
+static void try_flush(void) {
+    if (!s_flush_pending) {
+        return;
+    }
+    if (tuh_cdc_write_available(s_cdc_idx) >= CFG_TUH_CDC_TX_BUFSIZE) {
+        s_flush_pending = false; /* FIFO empty: already on its way */
+        return;
+    }
+    if (tuh_cdc_write_flush(s_cdc_idx) != 0u) {
+        s_flush_pending = false;
+    }
+}
+
+static bool send_frame(const uint8_t *frame, size_t n, uint64_t now) {
     if (tuh_cdc_write(s_cdc_idx, frame, (uint32_t)n) != n) {
         (void)tuh_cdc_write_clear(s_cdc_idx);
         INC(xfer_errors);
-        return;
+        return false;
     }
-    (void)tuh_cdc_write_flush(s_cdc_idx);
-    s_stream_start = false;
+    s_flush_pending = true;
+    try_flush();
     s_inflight = true;
     s_inflight_t = now;
+    return true;
+}
+
+static void queue_record(mb_rec_t *r, uint64_t now) {
+    s_tx_len = rec_finalize(s_tx_frame, r->payload, s_stream_start);
+    if (!send_frame(s_tx_frame, s_tx_len, now)) {
+        return;
+    }
+    s_stream_start = false;
+    s_tx_resent = false;
     s_inflight_frame = designated_frame(r->cycle);
     uint32_t q = (uint32_t)(now - r->t_pub_us);
     if (q > g_usbh.pub_to_queued_max_us) {
         g_usbh.pub_to_queued_max_us = q;
     }
+}
+
+/* Drop whatever is in flight or waiting in the FIFO (USBH-T6, F1). */
+static void drop_inflight(void) {
+    (void)tuh_cdc_write_clear(s_cdc_idx); /* M5: no partial frame */
+    s_inflight = false;
+    s_flush_pending = false;
 }
 
 static void stream_poll(uint64_t now) {
@@ -414,67 +496,97 @@ static void stream_poll(uint64_t now) {
     if (s_in_err_ev) {
         s_in_err_ev = false;
         INC(xfer_errors);
-        uint8_t dummy;
-        (void)tuh_cdc_read(s_cdc_idx, &dummy, 0u);
+        s_in_rearm = true;
+    }
+    /* F4: re-arm IN until TinyUSB has released the endpoint and the read is
+     * actually queued. A STALLed endpoint waits for its halt clear. */
+    if (s_in_rearm && !s_clear_req_in && !s_ctrl_busy) {
+        if (usbh_edpt_busy(s_daddr, s_ep_in)) {
+            s_in_rearm = false;
+        } else {
+            uint8_t dummy;
+            (void)tuh_cdc_read(s_cdc_idx, &dummy, 0u);
+            if (usbh_edpt_busy(s_daddr, s_ep_in)) {
+                s_in_rearm = false;
+            }
+        }
     }
 
     /* Completion of the record in flight. */
     if (s_out_done) {
         s_out_done = false;
-        s_inflight = false;
         uint8_t res = s_out_result;
         if (res == XFER_RESULT_SUCCESS) {
+            s_inflight = false;
             INC(sent);
             if (s_out_frame > s_inflight_frame) {
                 INC(late); /* H4: includes frames where IN returned data */
             }
         } else if (res == XFER_RESULT_STALLED) {
             INC(stall_out);
-            (void)tuh_cdc_write_clear(s_cdc_idx);
+            drop_inflight();
             s_clear_req_out = true;
         } else {
             INC(xfer_errors);
-            (void)tuh_cdc_write_clear(s_cdc_idx);
+            drop_inflight();
+            /* F5 / USBH-T6a: Pico-PIO-USB does not retry a transaction with
+             * no valid handshake, so resend the same frame once. If the
+             * device did receive the first copy, it discards the resend as
+             * a duplicate (same data toggle), so nothing is doubled. */
+            if (!s_tx_resent) {
+                s_tx_resent = true;
+                (void)send_frame(s_tx_frame, s_tx_len, now);
+            }
         }
     }
+    try_flush();
 
-    /* USBH-T6: abort a record not accepted within one period. */
+    /* USBH-T6: drop a record not accepted within one period. F1: clear it
+     * even if no transfer is active (the flush may never have started). */
     if (s_inflight && now - s_inflight_t >= USBH_STUCK_RECORD_US) {
-        if (tuh_edpt_abort_xfer(s_daddr, s_ep_out)) {
-            s_inflight = false;
-            (void)tuh_cdc_write_clear(s_cdc_idx); /* M5: no partial frame */
-            INC(aborted);
-        }
+        (void)tuh_edpt_abort_xfer(s_daddr, s_ep_out);
+        drop_inflight();
+        INC(aborted);
     }
 
     halt_poll(now);
 
+    /* USBH-T5 (F9): a slot whose record was not queued by its designated
+     * SOF is missing: never published, published late, or superseded in
+     * the mailbox before core 1 took it. Counted once, by time. */
+    while (s_have_seq && now >= designated_sof_us(s_last_seq + 1u)) {
+        s_last_seq++;
+        INC(missing);
+    }
+
     /* New record from core 0. */
     mb_rec_t r;
     if (mb_take(&r)) {
-        if (s_have_seq && r.cycle > s_last_seq + 1u) {
-            g_usbh.overwritten += (uint32_t)(r.cycle - s_last_seq - 1u);
-        }
-        s_have_seq = true;
-        s_last_seq = r.cycle;
-
-        uint64_t sof_us = s_sof_t0 + designated_frame(r.cycle) * TICK_PERIOD_US;
+        uint64_t sof_us = designated_sof_us(r.cycle);
         if (sof_us > r.t_pub_us) {
             uint32_t margin = (uint32_t)(sof_us - r.t_pub_us);
             if (g_usbh.pub_margin_min_us == 0u || margin < g_usbh.pub_margin_min_us) {
                 g_usbh.pub_margin_min_us = margin;
             }
         }
-        if (now >= sof_us) {
+        if (s_have_seq && r.cycle <= s_last_seq) {
+            /* Already counted missing (arrived after its SOF): never sent. */
+        } else if (now >= sof_us) {
             INC(missing); /* USBH-T5 / H1: too late for its frame; never sent */
-        } else if (s_inflight || s_clear_req_out || s_ctrl_busy) {
-            if (s_pending) {
-                INC(overwritten); /* newest wins */
-            }
-            s_pend_rec = r;
-            s_pending = true;
+            s_have_seq = true;
+            s_last_seq = r.cycle;
         } else {
-            queue_record(&r, now);
+            s_have_seq = true;
+            s_last_seq = r.cycle;
+            if (s_inflight || s_clear_req_out || s_ctrl_busy) {
+                if (s_pending) {
+                    INC(overwritten); /* USBH-T6: newest wins */
+                }
+                s_pend_rec = r;
+                s_pending = true;
+            } else {
+                queue_record(&r, now);
+            }
         }
     }
 
@@ -488,14 +600,14 @@ static void stream_poll(uint64_t now) {
 
 static bool s_attached;
 static bool s_enum_timeout_counted;
-static uint64_t s_attach_us;
+static uint32_t s_attach_us;
 
 static void events_poll(uint64_t now) {
     if (s_attach_ev) {
         s_attach_ev = false;
         INC(attaches);
         s_attached = true;
-        s_attach_us = now;
+        s_attach_us = s_attach_us32; /* F8: the attach event's own time */
         s_enum_timeout_counted = false;
     }
     if (s_detach_ev) {
@@ -505,7 +617,7 @@ static void events_poll(uint64_t now) {
     }
     /* USBH-3: not streaming within 2 s of attach (L8: may still stream later). */
     if (s_attached && !s_enum_timeout_counted && s_st != ST_STREAMING && s_st != ST_UNSUPPORTED &&
-        now - s_attach_us > USBH_ENUM_TIMEOUT_US) {
+        (uint32_t)now - s_attach_us > USBH_ENUM_TIMEOUT_US) {
         s_enum_timeout_counted = true;
         INC(enum_timeouts);
     }
