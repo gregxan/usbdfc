@@ -9,9 +9,36 @@
       "problemMatcher": "$gcc"
     },
     {
-      "label": "Flash with picotool (release)",
+      "label": "Build (diag)",
       "type": "shell",
-      "command": "picotool load -x -f build/release/firmware.uf2",
+      "command": "cmake --preset diag; cmake --build --preset diag",
+      "group": "build",
+      "problemMatcher": "$gcc"
+    },
+    {
+      "label": "Build test target (Pico 2)",
+      "type": "shell",
+      "command": "cmake --preset release; cmake --build --preset release",
+      "options": { "cwd": "${workspaceFolder}/test_target" },
+      "group": "build",
+      "problemMatcher": "$gcc"
+    },
+    {
+      "label": "Flash with picotool (board in BOOTSEL)",
+      "type": "shell",
+      "command": "picotool load -x build/release/firmware.uf2",
+      "problemMatcher": []
+    },
+    {
+      "label": "Flash diag build with picotool (no button)",
+      "type": "shell",
+      "command": "picotool load -x -f build/diag/firmware.uf2",
+      "problemMatcher": []
+    },
+    {
+      "label": "Flash test target with picotool (Pico 2 in BOOTSEL)",
+      "type": "shell",
+      "command": "picotool load -x test_target/build/release/test_target.uf2",
       "problemMatcher": []
     },
     {
