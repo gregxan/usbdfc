@@ -203,9 +203,7 @@ Firmware for a Seeed XIAO RP2350 that:
   supply VBUS, since a self-powered device detects attach from VBUS and
   shall not connect its D+ pull-up without it. The current limit is set for
   a low-power port: the switch shall supply at least 100 mA. *(Part TBD.)*
-- **USBH-7.** VBUS hardware: a 5 V load switch with a current limit and an
-  overcurrent flag, back-feed protection, series resistors on D+/D-,
-  15 kΩ pull-downs, and ESD protection.
+- **USBH-7.** VBUS and line hardware: see section 5.4 (HW-11 to HW-14).
 - **USBH-7a.** Self-powered device effects, to be checked in the hardware
   design:
   - **Ground loop.** The USB ground joins the two supplies. This shall not
@@ -214,8 +212,8 @@ Firmware for a Seeed XIAO RP2350 that:
   - **Unpowered XIAO.** With the XIAO unpowered and the device powered, D+/D-
     shall not back-power the RP2350. A compliant device keeps its pull-up
     off without VBUS; a non-compliant one shall not damage the XIAO.
-- **USBH-8.** RP2350-E9 risk: detach detection shall be verified on the
-  actual chip stepping.
+- **USBH-8.** RP2350-E9: only A4-stepping parts are supported (HW-10).
+  Detach detection shall still be verified on the actual boards.
 - **USBH-9.** Unsupported or failed devices.
   - **Unsupported device** (not CDC-ACM, low speed, a hub, or bulk
     endpoints under 64 bytes). TinyUSB sends SET_CONFIGURATION before any
@@ -367,7 +365,7 @@ whose SOF follows the record's publication.
   |---|---|---|---|
   | 0 | 1 | `version` | 1 |
   | 1 | 1 | `type` | 1 = magnetometer data. Other values are reserved. |
-  | 2 | 1 | `flags` | bit 0 valid; bit 1 stale (M-17); bit 2 stream start (USBH-T8); bit 3 saturated (any raw S or R axis within 72 counts of either end of the 18-bit range, D-1). Other bits are 0. |
+  | 2 | 1 | `flags` | bit 0 valid; bit 1 stale (M-17); bit 2 stream start (USBH-T8); bit 3 saturated (any raw S or R axis within 72 counts of either end of the 18-bit range, D-1); bit 4 unsupported chip stepping (HW-10). Other bits are 0. |
   | 3 | 1 | `reason` | 0 OK, 1 NO_PRIOR, 2 NOT_READY, 3 PAIR_INCOMPLETE (M-9) |
   | 4 | 4 | `boot_id` | u32 random value drawn at boot from the RP2350 hardware random-number generator (REC-4) |
   | 8 | 4 | `seq` | u32 cycle index since boot (M-20) |
@@ -445,6 +443,73 @@ whose SOF follows the record's publication.
   - **Release gate.** Before any units are distributed, a dedicated product
     ID shall be obtained from Raspberry Pi, which offers them for RP2040 and
     RP2350 products. NU-6 shall then be updated.
+
+### 5.4 Host-port hardware and power
+
+- **HW-10. Chip stepping.** Only XIAO RP2350 boards with an A4-stepping
+  RP2350 are supported. A4 fixes erratum E9, where GPIO inputs can latch
+  near 2 V and the 15 kΩ host pull-downs might not pull a detached line low.
+  - **Check at boot.** Firmware reads the chip revision from SYSINFO. The
+    register value for A4 is to be confirmed from the RP2350 datasheet.
+  - **On any other stepping,** firmware:
+    - sets `flags` bit 4 in every record (REC-2);
+    - reports the stepping in diagnostic status (NU-2);
+    - otherwise runs normally, with no automatic action (D-5).
+- **HW-11. Power.**
+  - **Source.** In production, an external regulated 5 V supply feeds the
+    XIAO's 5V pad. The same rail supplies VBUS through the load switch
+    (HW-12).
+  - **Rating.** The supply shall provide at least 250 mA. This covers the
+    XIAO, the MMC5983MA (about 6.4 mA typical plus SET/RESET pulses, M-23)
+    and the ≥ 100 mA VBUS allowance (USBH-6).
+  - **Back-feed.** Diagnostic builds may also have a PC on USB-C. The
+    connection between the XIAO's USB-C VBUS and its 5V pad shall be
+    checked on the Seeed schematic. If they are connected directly, the
+    external supply shall feed the 5V pad through a Schottky or ideal
+    diode, so it never drives the PC's VBUS and the PC never drives the
+    supply. The diode's drop lowers the VBUS voltage the device sees. That
+    is acceptable here, because the device is self-powered and uses VBUS
+    only to detect attach (USBH-6).
+- **HW-12. VBUS switch.** A current-limited 5 V load-switch module. Its
+  limit shall be set between 100 mA and 500 mA. *(Part TBD.)*
+  - **Enable.** On GPIO4 (pad D9), with an external pull-down of about
+    100 kΩ. VBUS is then off while the RP2350 is in reset or unpowered
+    (C1-7). An internal pull-down alone is not relied on.
+  - **Overcurrent flag.** The switch's open-drain flag goes to GPIO3 (pad
+    D10), with a pull-up.
+  - **Firmware control.** Firmware turns VBUS on in C1-8, after `tuh_init()`.
+    It turns it off before a BOOTSEL reboot (NU-5). It never cycles VBUS
+    otherwise (USBH-9).
+  - **Overcurrent handling.** Core 0 polls the flag once per epoch and
+    counts each assertion. The switch limits the current itself, so the
+    firmware takes no action (D-5).
+- **HW-13. Line components** (hand-wired modules):
+  - a 22 Ω series resistor in each of D+ (GPIO0) and D- (GPIO1), at the
+    XIAO pads;
+  - a 15 kΩ pull-down from each of D+ and D- to GND (USB host
+    termination);
+  - a low-capacitance ESD array on D+, D- and VBUS at the device
+    connection;
+  - wiring from the XIAO to the device connection kept short (no more than
+    10 cm), with D+ and D- twisted together and run beside GND.
+- **HW-14. Device connection.**
+  - **Header.** The downstream device is hard-wired. A 4-pin header carries
+    VBUS, D-, D+ and GND, with no host-side connector.
+  - **USB-C devices.** If the device has a USB-C receptacle, it shall be
+    connected with a USB-A-to-C cable cut to the header. The pull-up inside
+    that cable makes the device see a host.
+- **HW-15. Magnetic layout.** Following the datasheet's hardware design
+  considerations (p. 12):
+  - the 5 V supply wiring, the load switch, VBUS and the USB cable shall be
+    routed away from the MMC5983MA;
+  - no current-carrying wire shall pass under or over the sensor;
+  - magnetised parts (connector shells, ferrite, battery) shall be kept
+    clear of it.
+
+  The ground-loop check (USBH-7a) also applies.
+- **HW-9 (amended). Test pins.** Kept on D8 (GPIO2, the epoch marker) and D3
+  (GPIO5). D9 and D10 now carry the VBUS enable and the overcurrent flag
+  (HW-12).
 
 ## 6. Magnetometer (amendments)
 
@@ -554,7 +619,6 @@ filter.
 - NAK-full events
 - dropped records
 - ring overflows
-- VBUS overcurrent
 - core 1 frame-handler duration maximum, and SOF interval minimum and
   maximum (C1-2, C1-3)
 - maximum time from mailbox publish to queued (C1-4)
@@ -563,6 +627,7 @@ filter.
 - incomplete pairs (M-9)
 - core 1 SOF counter and loop heartbeat (cumulative; C1-7)
 - watchdog resets (kept across reset in watchdog scratch; C1-7)
+- VBUS overcurrent flag assertions (HW-12); chip stepping (HW-10)
 
 ## 8. Open decisions
 
@@ -607,6 +672,15 @@ filter.
    - CRC-16/CCITT-FALSE;
    - a random boot ID;
    - no temperature, and no status records.
+
+9. *(Closed: section 5.4.)* Hardware:
+   - A4 stepping only;
+   - an external 5 V supply on the 5V pad, with diode back-feed protection
+     if VBUS and the 5V pad are connected directly;
+   - hand-wired modules: a current-limited VBUS switch (enable on D9 with
+     an external pull-down, overcurrent flag on D10), 22 Ω series
+     resistors, 15 kΩ pull-downs and an ESD array;
+   - the device hard-wired through a 4-pin header.
 
 ## 9. Verification (to be written)
 
