@@ -67,7 +67,7 @@ Firmware for a Seeed XIAO RP2350 that:
   interrupts other than its SOF alarm, and its stack and hot data live in
   SCRATCH_X/Y.
 - **EX-1 (amended).** The core 0 main loop is the only consumer of
-  magnetometer data. It is also the only producer into the inter-core ring.
+  magnetometer data. It is also the only producer into the inter-core mailbox (IC-1).
 - **EX-5 (amended).** The priority order is: magnetometer completion and
   abort, then the tick, then native USB.
 - **EX-10 (amended).** The epoch runs at a fixed phase after the tick (about
@@ -275,7 +275,7 @@ Firmware for a Seeed XIAO RP2350 that:
   - **Class options.** `CFG_TUH_CDC_FTDI`, `CFG_TUH_CDC_CP210X` and
     `CFG_TUH_CDC_CH34X` are 0, and `CFG_TUH_HUB` is 0.
   - **Write path.** Only core 1 calls `tuh_cdc_write()` and
-    `tuh_cdc_write_flush()`, taking records from the IC-1 ring.
+    `tuh_cdc_write_flush()`, taking records from the IC-1 mailbox.
 - **USBH-S1a. Dual-role safety (diagnostic builds only).** TinyUSB has no
   cross-core locking. In a bare-metal build its only lock masks that
   stack's own interrupt on the calling core, and the PIO-USB host's lock is
@@ -367,7 +367,11 @@ whose SOF follows the record's publication.
     (one period) after it was queued, core 1 aborts the transfer, counts the
     record as aborted, and queues the newest record from the mailbox. A
     device that recovers therefore receives fresh data, never a stale
-    record. *(Verify that `hcd_pio_usb` supports TinyUSB's transfer abort.)*
+    record. *(Verified: `hcd_edpt_abort_xfer()` calls Pico-PIO-USB's
+    `pio_usb_host_endpoint_abort_transfer()`, which may busy-wait about one
+    frame on core 1 while an in-flight transaction finishes. This is the only
+    permitted block while streaming.)* After an abort, the CDC transmit FIFO
+    is cleared (`tuh_cdc_write_clear()`), so no partial frame is sent.
   - **Counted.** Late, aborted and overwritten records are counted.
 - **USBH-T7 (requirement on the downstream device).** The device shall accept
   one packet of up to 64 bytes per 20 ms period, continuously.
@@ -396,7 +400,7 @@ whose SOF follows the record's publication.
   | 0 | 1 | `version` | 1 |
   | 1 | 1 | `type` | 1 = magnetometer data. Other values are reserved. |
   | 2 | 1 | `flags` | bit 0 valid; bit 1 stale (M-17); bit 2 stream start (USBH-T8); bit 3 saturated (any raw S or R axis within 72 counts of either end of the 18-bit range, D-1); bit 4 unsupported chip stepping (HW-10). Other bits are 0. |
-  | 3 | 1 | `reason` | 0 OK, 1 NO_PRIOR, 2 NOT_READY, 3 PAIR_INCOMPLETE (M-9) |
+  | 3 | 1 | `reason` | 0 OK, 1 NO_PRIOR, 2 NOT_READY, 3 PAIR_INCOMPLETE, 4 SENSOR_FAULT (M-9, section 8a M3) |
   | 4 | 4 | `boot_id` | u32 random value drawn at boot from the RP2350 hardware random-number generator (REC-4) |
   | 8 | 4 | `seq` | u32 cycle index since boot (M-20) |
   | 12 | 8 | `t_us` | u64 µs since boot, at the S trigger (M-10, M-22) |
@@ -669,7 +673,15 @@ below.
   - **Rate limit.** At most one halt clear per endpoint per second. A STALL
     that occurs within a second of the last clear is counted and left until
     the next second.
-  - *(Verify how TinyUSB `86ad6e5` and `hcd_pio_usb` reset the toggle.)*
+  - **Toggle reset.** `hcd_edpt_clear_stall()` in `hcd_pio_usb` is an empty
+    stub, and TinyUSB `86ad6e5` has no host-side clear-halt function. So the
+    application does both itself:
+    1. It sends CLEAR_FEATURE (ENDPOINT_HALT) with `tuh_control_xfer()`.
+    2. On success, it sets that endpoint's `data_id` in Pico-PIO-USB's
+       public endpoint pool (`pio_usb_ep_pool`, `pio_usb_ll.h`) to DATA0.
+
+    This relies on Pico-PIO-USB internals at `fe9133f`, and shall be
+    re-checked whenever USBH-S2 changes.
 
 **Recovery.** The only automatic recovery action is the watchdog reset
 (C1-7).
@@ -815,6 +827,41 @@ TX DMA completions (D-3a).
     - a 5-minute soak;
     - relative magnetic tests on a quiet bench with a hand-wound coil.
 
+## 8a. Implementation assumptions (Rev 3.0-draft)
+
+These items were found open when implementation began. Each is answered
+with the recommended choice below, and the firmware follows these answers.
+Any of them can be overturned by amending this section.
+
+| # | Item | Assumption implemented |
+|---|---|---|
+| H1 | Designated frame | **Defined from the schedule, not from publication.** The designated SOF for cycle N is the SOF at cycle N's tick 0 plus the C1-5 offset (tick 0 + 600 µs). Core 1 computes it from TIMER0, using the cycle start that core 0 publishes once at start-up. A record that is not in the mailbox by its designated SOF is never sent: core 1 discards it and counts a missing slot (USBH-T5). |
+| H2 | Pair against single mode | Pair mode is implemented. A build option, `MAG_MODE_SINGLE` (diagnostic builds), does one SET at start-up and then single measurements at ticks 0 and 10. Each single-mode record carries one measurement in `d` (as raw − 131072) with `s` = 0, and sets REC `type` = 2. It exists for the V-18 comparison only. |
+| H3 | Abort and toggle reset | Resolved from source (USBH-T6, section 7.1). |
+| H4 | Cadence with IN data | USBH-T1's ±10 µs applies while bulk IN returns NAK. A frame in which IN returns data is exempt, and its record is counted as late if it completes after its designated frame. |
+| M1 | Mailbox protocol | **Three slots, with a `newest` index and a `reading` index**, each a 32-bit word written by one core only.<br>**Core 0:** writes a slot that is neither `newest` nor `reading`, issues a DMB, then stores `newest`.<br>**Core 1:** loads `newest` and stores it in `reading`, issues a DMB, then re-loads `newest`. If `newest` has changed, it repeats. Otherwise it copies the slot.<br>Each slot carries its `seq`, so a duplicate take is detected. |
+| M2 | Mailbox contents | Core 0 builds the complete 48-byte COBS frame, CRC and flags included, plus its `seq` and cycle number. Core 1 copies the bytes unchanged. |
+| M3 | Sensor fault | Reason code 4, `SENSOR_FAULT`, is added to REC v1. It applies while the fault flag is set (M-2a) and takes precedence over the other codes. |
+| M4 | No device mounted | Core 1 counts late, aborted, overwritten and missing-slot records only while a CDC device is mounted. While none is mounted, it takes records from the mailbox and discards them, uncounted. |
+| M5 | Transmit FIFO after an abort | It is cleared (USBH-T6). |
+| M6 | DFC references | References to DFC tests are written "DFC V-n". usbdfc's own tests are V-1 to V-20. |
+| M7 | Test target timing | **The test target is a Pico 2 (RP2350).** It has a DWT cycle counter. VE-1's "8 ns at 125 MHz" becomes "6.7 ns at 150 MHz". |
+| M8 | Real device | It is assumed to behave like the test target in normal mode. |
+| M9 | Re-probe in the cycle | While faulted, the re-probe (M-2a) runs at tick 0 of every tenth cycle, which is 5 Hz. After a successful re-configuration, the pair schedule restarts at the next tick 0, and that record is marked NO_PRIOR. |
+| M10 | Presets | `release` (production), `debug`, and `diag`: native USB status, D3/D8 markers and the V-14 stall hook. `diag-single` adds H2's single mode, and `diag-spacing5` adds V-19's 5 ms spacing. |
+| L1 | `seq` | The cycle in which S was triggered. |
+| L2 | Stale flag | Set by core 0 if the record is more than 30 ms old (from `t_us`) when it is built. |
+| L3 | Watchdog scratch | `scratch[0]` holds a magic value and `scratch[1]` the count. `scratch[4..7]` are left to the SDK's reboot functions. Only watchdog timeouts are counted, not SDK-requested reboots. |
+| L4 | VBUS pin owner | Core 0 owns VBUS_EN and the overcurrent input. Core 1 signals that `tuh_init()` is done through the SIO FIFO, and core 0 then enables VBUS. |
+| L5 | Switch limit | Set at 150–250 mA, within HW-12's range, so V-12 cannot brown out the 250 mA supply. |
+| L6 | EX-4 scope | EX-3, EX-4 and EX-7 apply to core 0. Core 1's limits are C1-2 to C1-4. |
+| L7 | SOF tolerance | 1000 µs ± 0.5 µs is kept, pending a check against the USB 2.0 specification. |
+| L8 | Mount after the 2 s timeout | Streaming starts. The earlier enumeration-timeout count stays. |
+| L9 | Blocking TinyUSB calls | Only asynchronous TinyUSB calls are used: every `tuh_control_xfer()` has a completion callback. |
+| L10 | Test target UART | 921,600 baud. "Never ACK" NAKs only data and status stages; SETUP packets are always acknowledged. |
+| L11 | Lookups | The A4 SYSINFO value is looked up when HW-10 is implemented. Until then, the firmware reports the raw revision field, and the A4 check is a named constant. |
+| L12 | Wording | Core 1 data is in SCRATCH_X only; the mailbox replaces "ring". |
+
 ## 9. Verification
 
 All tools run on Windows, and test scripts are written in Python (V-7,
@@ -822,13 +869,13 @@ carried over from DFC). Timing tests use free-running builds (C1-9).
 
 ### 9.1 Equipment
 
-- **VE-1. Test target device.** A Raspberry Pi Pico runs project-supplied
+- **VE-1. Test target device.** A Raspberry Pi Pico 2 runs project-supplied
   TinyUSB CDC-ACM firmware (`test_target/` in this repository) and acts as
   the downstream device.
   - **Checks it makes.** It checks every frame's COBS framing, CRC
     (REC-3), `seq` and `boot_id` continuity.
-  - **Timestamps.** It timestamps, using its CPU cycle counter (8 ns at
-    125 MHz):
+  - **Timestamps.** It timestamps, using its DWT cycle counter (6.7 ns at
+    150 MHz; the test target is a Pico 2, section 8a M7):
     - each SOF, from its SOF interrupt;
     - each completed bulk OUT packet;
     - each edge on one input wired to the XIAO's D3 test pin.
