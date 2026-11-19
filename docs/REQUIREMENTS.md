@@ -517,12 +517,6 @@ filter.
 6. D-5: which host retries, STALL clears and re-enumerations count as normal
    operation. *(Partly closed: USBH-9 covers the TinyUSB and Pico-PIO-USB
    retries, and C1-7 adds the watchdog-reset exception.)*
-8. *(Closed: section 5.2.)* Record format:
-   - a 46-byte binary payload, COBS-framed into 48 bytes, one packet each;
-   - raw counts, sent as S − R and S + R, little-endian;
-   - CRC-16/CCITT-FALSE;
-   - a random boot ID;
-   - no temperature, and no status records.
 7. *(Closed: IC-1 to IC-3, section 4.1.)* Core 1 execution model:
    - a triple-buffer mailbox, which core 1 polls in a tight loop;
    - single-writer counters;
@@ -530,6 +524,12 @@ filter.
    - liveness through a watchdog, fed by core 0 only while both cores make
      progress;
    - the start-up order.
+8. *(Closed: section 5.2.)* Record format:
+   - a 46-byte binary payload, COBS-framed into 48 bytes, one packet each;
+   - raw counts, sent as S − R and S + R, little-endian;
+   - CRC-16/CCITT-FALSE;
+   - a random boot ID;
+   - no temperature, and no status records.
 
 ## 9. Verification (to be written)
 
