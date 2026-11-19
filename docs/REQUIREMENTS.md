@@ -324,20 +324,55 @@ whose SOF follows the record's publication.
   - **Sequence numbers.** A record's sequence number is its cycle index
     since boot (M-20). It keeps counting across a detach and re-attach, so
     the device can see what it missed. A reboot restarts it from zero.
-  - **Boot identity.** Each record carries a boot identifier: the
-    watchdog-reset count (C1-7) plus a power-on count, *format TBD in the
-    record-format decisions (F)*. A reboot is therefore never mistaken for
-    a sequence wrap.
+  - **Boot identity.** Each record carries a random boot identifier
+    (REC-4), so a reboot is never mistaken for a sequence wrap.
 
 ### 5.2 Record format
 
-The record is binary, framed with COBS, and protected by a CRC-16. Its
-fields:
+- **REC-1. Encoding.** Each record is a binary frame:
+  - the 46-byte payload below, COBS-encoded;
+  - followed by a single 0x00 delimiter.
 
-- sequence number;
-- trigger timestamp;
-- X/Y/Z, 16-bit or 18-bit (*TBD*);
-- reason code and stale flag.
+  The encoded frame is 48 bytes, so it fits one 64-byte packet (USBH-5).
+  Each record goes out in exactly one bulk OUT transfer. The stream carries
+  data records only: no status or heartbeat records.
+- **REC-2. Payload.** All multi-byte fields are little-endian.
+
+  | Offset | Size | Field | Contents |
+  |---|---|---|---|
+  | 0 | 1 | `version` | 1 |
+  | 1 | 1 | `type` | 1 = magnetometer data. Other values are reserved. |
+  | 2 | 1 | `flags` | bit 0 valid; bit 1 stale (M-17); bit 2 stream start (USBH-T8); bit 3 saturated (any raw S or R axis within 72 counts of either end of the 18-bit range, D-1). Other bits are 0. |
+  | 3 | 1 | `reason` | 0 OK, 1 NO_PRIOR, 2 NOT_READY, 3 PAIR_INCOMPLETE (M-9) |
+  | 4 | 4 | `boot_id` | u32 random value drawn at boot from the RP2350 hardware random-number generator (REC-4) |
+  | 8 | 4 | `seq` | u32 cycle index since boot (M-20) |
+  | 12 | 8 | `t_us` | u64 µs since boot, at the S trigger (M-10, M-22) |
+  | 20 | 12 | `d_x`, `d_y`, `d_z` | i32 S − R per axis, in raw 18-bit counts |
+  | 32 | 12 | `s_x`, `s_y`, `s_z` | i32 S + R − 262144 per axis, in raw 18-bit counts |
+  | 44 | 2 | `crc` | CRC-16 over bytes 0 to 43 (REC-3) |
+
+  **Units.** Raw counts at 16384 counts per gauss (datasheet p. 2). No
+  scaling or calibration is applied on the XIAO. The receiver computes
+  field H = d / 2 and offset O = s / 2, in counts. The firmware sends the
+  sum and difference rather than the halved values, so no half-count is
+  rounded away (amends M-22).
+- **REC-3. CRC.** CRC-16/CCITT-FALSE:
+  - polynomial 0x1021, initial value 0xFFFF;
+  - not reflected, final XOR 0x0000;
+  - check value 0x29B1 for the ASCII string "123456789";
+  - computed over the payload before COBS encoding.
+
+  The receiver discards any frame whose CRC or length is wrong.
+- **REC-4. Boot identity (amends USBH-T8).** `boot_id` is a fresh random
+  32-bit value on every boot, whether power-on, watchdog or other reset. A
+  change in `boot_id` marks a reboot, whatever `seq` does. No flash writes
+  are needed. The watchdog-reset count (C1-7) stays a diagnostic counter and
+  is not in the record.
+- **REC-5. Temperature.** Not reported. The SET/RESET pair cancels the
+  temperature-driven offset drift (M-22). The datasheet gives no
+  temperature-measurement time, and none is scheduled (M-23).
+- **REC-6. Compatibility.** A receiver shall ignore frames with an unknown
+  `version` or `type`. A new field or meaning requires a new `version`.
 
 ## 6. Magnetometer (amendments)
 
@@ -378,8 +413,10 @@ filter.
 - **M-22 (new). The record.** Core 0 computes each record from the S and R
   of one cycle:
   - **Field:** H = (S − R) / 2 per axis, from the raw 18-bit counts. This
-    cancels the bridge offset and its temperature drift.
-  - **Offset (diagnostic):** O = (S + R) / 2 per axis, sent in the record.
+    cancels the bridge offset and its temperature drift. The record carries
+    S − R exactly; the receiver halves it (REC-2).
+  - **Offset (diagnostic):** O = (S + R) / 2 per axis. The record carries
+    S + R − 262144 exactly; the receiver halves it (REC-2).
   - **Timestamp:** the S trigger time (M-10's definition). The record covers
     the time from the S trigger to the R trigger plus 8 ms.
   - **Sequence number:** the cycle index.
@@ -480,6 +517,12 @@ filter.
 6. D-5: which host retries, STALL clears and re-enumerations count as normal
    operation. *(Partly closed: USBH-9 covers the TinyUSB and Pico-PIO-USB
    retries, and C1-7 adds the watchdog-reset exception.)*
+8. *(Closed: section 5.2.)* Record format:
+   - a 46-byte binary payload, COBS-framed into 48 bytes, one packet each;
+   - raw counts, sent as S − R and S + R, little-endian;
+   - CRC-16/CCITT-FALSE;
+   - a random boot ID;
+   - no temperature, and no status records.
 7. *(Closed: IC-1 to IC-3, section 4.1.)* Core 1 execution model:
    - a triple-buffer mailbox, which core 1 polls in a tight loop;
    - single-writer counters;
