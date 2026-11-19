@@ -54,18 +54,66 @@ Firmware for a Seeed XIAO RP2350 that:
 ## 5. USB
 
 - **USBH-1.** The host port is PIO-USB on a consecutive GPIO pair. The
-  candidates are GPIO0/1 (D6/D7) and GPIO20/21. The port shall be full
-  speed only, with no hub support.
-- **USBH-2.** The supported device class is CDC-ACM. Whether vendor USB-serial
-  bridges are also supported is *TBD*.
+  candidates are GPIO0/1 (D6/D7) and GPIO20/21. *(Pin choice TBD.)*
+- **USBH-1a.** The port shall support only a full-speed device attached
+  directly. A low-speed device, or a hub, shall be treated as unsupported
+  (USBH-9).
+- **USBH-2.** The only supported class is CDC-ACM: a communication interface
+  (class 0x02, subclass 0x02) paired with a data interface (class 0x0A)
+  that has one bulk IN and one bulk OUT endpoint. Any communication-interface
+  protocol code is accepted. On a composite device, the first CDC-ACM
+  function is used, located through its Interface Association Descriptor or
+  its Union functional descriptor. Vendor USB-serial bridges (FTDI, CP210x,
+  CH34x) are not supported.
 - **USBH-3.** Enumeration is a non-blocking state machine timed by the tick.
-  Enumeration time shall be at most 500 ms from attach. *TBD*.
-- **USBH-4.** The host sets the line coding and asserts DTR after enumeration.
-- **USBH-5.** VBUS hardware: a 5 V load switch with a current limit and an
+  It shall complete within 500 ms of attach. *(Limit TBD by measurement.)*
+- **USBH-4.** After SET_CONFIGURATION, the host shall send:
+  1. SET_LINE_CODING: 115,200 baud, 8 data bits, no parity, 1 stop bit.
+     Native-USB CDC devices ignore the value; it is sent for devices that
+     expect it.
+  2. SET_CONTROL_LINE_STATE with DTR = 1 and RTS = 1.
+
+  Streaming starts once both have completed. A STALL on either request is
+  counted and tolerated, and streaming starts anyway: both requests are
+  optional in CDC-ACM.
+- **USBH-4a.** The host shall poll the bulk IN endpoint once per output
+  period, after that period's data OUT and within the remaining frame
+  budget. This keeps the device's transmit buffer from filling. Bytes
+  received are counted and discarded. A NAK is the expected, normal
+  response. The CDC notification (interrupt IN) endpoint is not polled.
+- **USBH-5.** Max packet size:
+  - **Bulk endpoints.** Both bulk endpoints shall report a maximum packet
+    size of 64 bytes. A device reporting less is unsupported (USBH-9). One
+    record fits in one packet.
+  - **EP0.** Any EP0 maximum packet size allowed at full speed (8, 16, 32
+    or 64 bytes) shall be accepted for control transfers.
+- **USBH-6.** The downstream device is self-powered. The host shall still
+  supply VBUS, since a self-powered device detects attach from VBUS and
+  shall not connect its D+ pull-up without it. The current limit is set for
+  a low-power port: the switch shall supply at least 100 mA. *(Part TBD.)*
+- **USBH-7.** VBUS hardware: a 5 V load switch with a current limit and an
   overcurrent flag, back-feed protection, series resistors on D+/D-,
   15 kΩ pull-downs, and ESD protection.
-- **USBH-6.** RP2350-E9 risk: detach detection shall be verified on the
+- **USBH-7a.** Self-powered device effects, to be checked in the hardware
+  design:
+  - **Ground loop.** The USB ground joins the two supplies. This shall not
+    degrade the MMC5983MA noise floor (measure with and without the device
+    attached).
+  - **Unpowered XIAO.** With the XIAO unpowered and the device powered, D+/D-
+    shall not back-power the RP2350. A compliant device keeps its pull-up
+    off without VBUS; a non-compliant one shall not damage the XIAO.
+- **USBH-8.** RP2350-E9 risk: detach detection shall be verified on the
   actual chip stepping.
+- **USBH-9.** On an unsupported device, or a failed enumeration (timeout,
+  STALL or error on a standard request), the host shall:
+  1. increment the matching counter (unsupported device, or enumeration
+     failure);
+  2. leave the device unconfigured, with no retries, VBUS cycling or bus
+     reset;
+  3. wait for detach.
+
+  A new attach starts a new enumeration. This is a new event, not a retry,
+  so it is normal operation under D-5.
 - **B-19 / B-20 (rewritten).** Native USB is a CDC device to a PC, for
   status and flashing. It may stay enabled in production.
 
@@ -108,6 +156,9 @@ fields:
 
 - attach and detach events
 - enumeration failures
+- unsupported devices (USBH-9)
+- STALLs on SET_LINE_CODING or SET_CONTROL_LINE_STATE (USBH-4)
+- bytes received on bulk IN and discarded (USBH-4a)
 - transfer errors: CRC, timeout, babble, STALL
 - NAK-full events
 - dropped records
@@ -117,8 +168,11 @@ fields:
 
 ## 8. Open decisions
 
-1. The downstream device: which one, CDC-ACM or a vendor bridge, and whether
-   it is bus-powered.
+1. *(Closed: section 5, USBH-1a to USBH-9.)* The downstream device is a
+   self-powered CDC-ACM device at full speed, attached directly. Bulk
+   endpoints are 64 bytes. The host sets the line coding and DTR/RTS, polls
+   IN and discards the data, and treats unsupported devices as counted and
+   left alone. The specific product is still to be named.
 2. The output period: 1 ms or 2 ms. A 2 ms period also needs the per-sample
    mode decided: single, averaged, or SET/RESET differenced.
 3. The Pico-PIO-USB version and `clk_sys`.
