@@ -276,11 +276,12 @@ Firmware for a Seeed XIAO RP2350 that:
     `CFG_TUH_CDC_CH34X` are 0, and `CFG_TUH_HUB` is 0.
   - **Write path.** Only core 1 calls `tuh_cdc_write()` and
     `tuh_cdc_write_flush()`, taking records from the IC-1 mailbox.
-- **USBH-S1a. Dual-role safety (diagnostic builds only).** TinyUSB has no
-  cross-core locking. In a bare-metal build its only lock masks that
-  stack's own interrupt on the calling core, and the PIO-USB host's lock is
-  empty. Its device and host halves keep separate state. Dual-role use is
-  safe only under these rules:
+- **USBH-S1a. Dual-role safety (diagnostic builds only).** The Pico SDK
+  builds TinyUSB with `CFG_TUSB_OS = OPT_OS_PICO`, not the bare-metal layer.
+  Its event queues are therefore protected by SDK critical sections, which
+  combine a spinlock with interrupt masking and are safe across cores.
+  TinyUSB's device and host halves keep separate state. Dual-role use shall
+  still follow these rules:
   1. All device-side calls, `tud_init()`, `tud_task()` and the native USB
      interrupt stay on core 0.
   2. All host-side calls, `tuh_init()`, `tuh_task()` and the SOF interrupt
@@ -328,8 +329,25 @@ Firmware for a Seeed XIAO RP2350 that:
   PIO2 stays free.
 - **B-25 (extended).** Every TinyUSB and Pico-PIO-USB source compiled into
   the image is held to B-22 … B-24. Exceptions are listed file by file, with
-  a written justification. The list is to be filled in after the first
-  build and reviewed whenever USBH-S2 changes.
+  a written justification, in `cmake/third_party_warnings.cmake`, and
+  reviewed whenever USBH-S2 changes.
+  - **First build** (SDK 2.2.0, TinyUSB `86ad6e5`, Pico-PIO-USB `fe9133f`):
+    TinyUSB compiles clean.
+  - **Pico-PIO-USB:** `pio_usb.c`, `pio_usb_host.c` and `pio_usb_device.c`
+    have `-Wconversion` and `-Wsign-conversion` warnings made non-fatal.
+    `pio_usb_host.c` also has its `-Wstack-usage` warning made non-fatal,
+    for its unused standalone `enumerate_device()`, which the linker drops.
+  - **SDK:** `pico_rand/rand.c` has one `-Wconversion` warning made
+    non-fatal.
+- **USBH-S6. Transfer results.** TinyUSB's CDC host never reports a failed
+  or STALLed bulk transfer to the application: `cdch_xfer_cb` asserts and
+  returns. The firmware therefore links with `-Wl,--wrap=hcd_event_handler`,
+  and its wrapper:
+  - observes attach, detach and transfer-complete events, with their
+    results, for USBH-3, USBH-T6 and section 7.1;
+  - then calls the real handler.
+
+  The library is not modified.
 
 ### 5.1 Output timing
 
@@ -836,11 +854,11 @@ Any of them can be overturned by amending this section.
 | # | Item | Assumption implemented |
 |---|---|---|
 | H1 | Designated frame | **Defined from the schedule, not from publication.** The designated SOF for cycle N is the SOF at cycle N's tick 0 plus the C1-5 offset (tick 0 + 600 µs). Core 1 computes it from TIMER0, using the cycle start that core 0 publishes once at start-up. A record that is not in the mailbox by its designated SOF is never sent: core 1 discards it and counts a missing slot (USBH-T5). |
-| H2 | Pair against single mode | Pair mode is implemented. A build option, `MAG_MODE_SINGLE` (diagnostic builds), does one SET at start-up and then single measurements at ticks 0 and 10. Each single-mode record carries one measurement in `d` (as raw − 131072) with `s` = 0, and sets REC `type` = 2. It exists for the V-18 comparison only. |
+| H2 | Pair against single mode | Pair mode is implemented. A build option, `MAG_MODE_SINGLE` (the `diag-single` preset), does one SET at start-up and then one measurement per cycle, triggered at tick 0 with no pulse. Each single-mode record carries that measurement in `d` (as raw − 131072) with `s` = 0, and sets REC `type` = 2. It exists for the V-18 comparison only. |
 | H3 | Abort and toggle reset | Resolved from source (USBH-T6, section 7.1). |
 | H4 | Cadence with IN data | USBH-T1's ±10 µs applies while bulk IN returns NAK. A frame in which IN returns data is exempt, and its record is counted as late if it completes after its designated frame. |
 | M1 | Mailbox protocol | **Three slots, with a `newest` index and a `reading` index**, each a 32-bit word written by one core only.<br>**Core 0:** writes a slot that is neither `newest` nor `reading`, issues a DMB, then stores `newest`.<br>**Core 1:** loads `newest` and stores it in `reading`, issues a DMB, then re-loads `newest`. If `newest` has changed, it repeats. Otherwise it copies the slot.<br>Each slot carries its `seq`, so a duplicate take is detected. |
-| M2 | Mailbox contents | Core 0 builds the complete 48-byte COBS frame, CRC and flags included, plus its `seq` and cycle number. Core 1 copies the bytes unchanged. |
+| M2 | Mailbox contents | Core 0 builds the 46-byte payload with every field and flag except the stream-start flag, and adds the cycle number and publish time. Core 1 sets stream-start when it applies, computes the CRC and COBS-encodes the frame. Only core 1 knows when a stream starts. |
 | M3 | Sensor fault | Reason code 4, `SENSOR_FAULT`, is added to REC v1. It applies while the fault flag is set (M-2a) and takes precedence over the other codes. |
 | M4 | No device mounted | Core 1 counts late, aborted, overwritten and missing-slot records only while a CDC device is mounted. While none is mounted, it takes records from the mailbox and discards them, uncounted. |
 | M5 | Transmit FIFO after an abort | It is cleared (USBH-T6). |
@@ -859,7 +877,7 @@ Any of them can be overturned by amending this section.
 | L8 | Mount after the 2 s timeout | Streaming starts. The earlier enumeration-timeout count stays. |
 | L9 | Blocking TinyUSB calls | Only asynchronous TinyUSB calls are used: every `tuh_control_xfer()` has a completion callback. |
 | L10 | Test target UART | 921,600 baud. "Never ACK" NAKs only data and status stages; SETUP packets are always acknowledged. |
-| L11 | Lookups | The A4 SYSINFO value is looked up when HW-10 is implemented. Until then, the firmware reports the raw revision field, and the A4 check is a named constant. |
+| L11 | Lookups | The A4 check uses the SDK's `rp2350_chip_version()`, which decodes the SYSINFO revision (0 = A0, 1 = A1, 2 = A2). Its mapping gives 4 for A4. HW-10 treats `rp2350_chip_version() >= 4` as A4 or later; to be confirmed on an A4 board (V-15). The XIAO's VBUS-to-5V path is still to be checked on the schematic. |
 | L12 | Wording | Core 1 data is in SCRATCH_X only; the mailbox replaces "ring". |
 
 ## 9. Verification

@@ -10,13 +10,13 @@ advance "Last DFC commit reviewed".
 
 | usbdfc file | DFC source | Status |
 |---|---|---|
-| src/mag.c, src/mag.h | src/mag.c, src/mag.h | not yet copied |
-| src/mmc5983ma.h | src/mmc5983ma.h | not yet copied |
-| src/i2c_bus_clear.pio | src/i2c_bus_clear.pio | not yet copied |
-| src/tick.c, src/tick.h | src/tick.c, src/tick.h | not yet copied (remove U-8 and the `link` call) |
-| src/diag.c, src/diag.h | src/diag.c, src/diag.h | not yet copied |
-| src/prof.c, src/prof.h | src/prof.c, src/prof.h | not yet copied |
-| src/config.h (parts) | src/config.h | not yet copied |
+| src/mag.c, src/mag.h | src/mag.c, src/mag.h | copied and adapted: transaction engine, aborts, bus clear, re-probe kept; schedule, pairs, reasons, BW, PIO1 changed (M-20 to M-23) |
+| src/mmc5983ma.h | src/mmc5983ma.h | copied; BW = 00/01 constants added |
+| src/i2c_bus_clear.pio | src/i2c_bus_clear.pio | copied unchanged (clock divider now set from clk_sys in mag.c) |
+| src/tick.c, src/tick.h | src/tick.c, src/tick.h | copied; UART bookkeeping removed, 64-bit tick index |
+| src/diag.c, src/diag.h | src/diag.c, src/diag.h | copied; counter and timing lists replaced (section 7.2), per-core DWT enable |
+| src/prof.c, src/prof.h | src/prof.c, src/prof.h | copied; section list changed |
+| src/config.h (parts) | src/config.h | magnetometer, priority and instrumentation parts copied and amended; UART parts dropped |
 
 ## Ported DFC changes
 

@@ -1,0 +1,23 @@
+; I2C bus clear (M-18): nine SCL clocks at about 100 kHz, open-drain.
+; Copied from DFC Rev 2.16 (B-26).
+;
+; The SCL pad's output latch is held at 0, so "set pindirs, 1" pulls SCL
+; low and "set pindirs, 0" releases it to the pull-up. Started by pushing
+; any word to the TX FIFO; signals completion by pushing a word to the RX
+; FIFO. mag.c sets the clock divider for a 160 ns cycle at any clk_sys
+; (19.2 at 120 MHz), so 32 cycles is ~5.1 us and one clock is ~10.2 us.
+; Total runtime ~100 us.
+;
+; SET pins and IN pins both map to SCL.
+
+.program i2c_bus_clear
+.wrap_target
+    pull block            ; wait for a start request
+    wait 1 pin 0    [31]  ; SCL released by the I2C controller
+    set x, 8        [31]  ; 9 clocks
+clk:
+    set pindirs, 1  [31]  ; SCL low
+    set pindirs, 0  [30]  ; SCL released
+    jmp x-- clk
+    push noblock    [31]  ; done
+.wrap
