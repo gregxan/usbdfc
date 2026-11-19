@@ -809,12 +809,175 @@ TX DMA completions (D-3a).
      resistors, 15 kΩ pull-downs and an ESD array;
    - the device hard-wired through a 4-pin header.
 
-## 9. Verification (to be written)
+10. *(Closed: section 9.)* Verification:
+    - a second Pico as the test target;
+    - no logic analyzer yet, so an interim timing method is used;
+    - a 5-minute soak;
+    - relative magnetic tests on a quiet bench with a hand-wound coil.
 
-- **Bus capture.** Capture D+/D- for at least 10 minutes with a full-speed
-  decoder and check every packet interval.
-- **Re-run timing.** Run V-5 (ISR, critical-section and epoch timing) on core
-  0 while core 1 is busy.
-- **Fault tests.** Hot-plug loops, a device that stops reading, a device that
-  STALLs, a VBUS short, and the E9 detach test.
-- **Magnetometer.** Run V-5a and V-6, carried over from DFC.
+## 9. Verification
+
+All tools run on Windows, and test scripts are written in Python (V-7,
+carried over from DFC). Timing tests use free-running builds (C1-9).
+
+### 9.1 Equipment
+
+- **VE-1. Test target device.** A Raspberry Pi Pico runs project-supplied
+  TinyUSB CDC-ACM firmware (`test_target/` in this repository) and acts as
+  the downstream device.
+  - **Checks it makes.** It checks every frame's COBS framing, CRC
+    (REC-3), `seq` and `boot_id` continuity.
+  - **Timestamps.** It timestamps, using its CPU cycle counter (8 ns at
+    125 MHz):
+    - each SOF, from its SOF interrupt;
+    - each completed bulk OUT packet;
+    - each edge on one input wired to the XIAO's D3 test pin.
+  - **Forwarding.** It forwards the frames and timestamps to the PC through
+    a UART-to-USB adapter. A command over that UART selects its mode
+    (VE-2).
+- **VE-2. Test target modes.**
+  - normal;
+  - NAK every OUT for a given time (for example 5 ms, 50 ms or 5 s);
+  - never ACK;
+  - STALL bulk OUT once, or repeatedly;
+  - STALL bulk IN;
+  - send data on bulk IN;
+  - bulk endpoints of 32 bytes;
+  - not CDC (a vendor-class interface);
+  - no line-request support in the ACM descriptor;
+  - STALL on SET_LINE_CODING.
+- **VE-3. Logic analyzer (not yet available).** To be bought. It needs:
+  - at least 100 MS/s;
+  - USB full-speed and I2C decoders;
+  - at least 6 channels: D+, D-, SDA, SCL and two markers;
+  - streaming to the PC for at least 5 minutes.
+
+  **Until then.** Tests marked [LA] use the interim method given with each
+  one, and record its measurement uncertainty.
+- **VE-4. Magnetic bench.** No chamber, coil rig or reference magnetometer
+  is available.
+  - **Location.** A magnetically quiet bench, at least 1 m from mains
+    equipment, steel and monitors, with its location recorded.
+  - **Coil.** A hand-wound coil, about 50 turns of 10 cm diameter. It is
+    driven by the test-target Pico through a transistor and series
+    resistor, as a PWM-synthesised sine at 50 Hz and 60 Hz.
+  - **Results are relative.** The pair mode is compared with the single
+    mode, and the response with the coil on is compared with coil off.
+
+### 9.2 Streaming and timing
+
+- **V-1. Soak.** Stream into the test target, in normal mode, for
+  5 minutes (15,000 records). Pass criteria:
+  - no CRC or framing errors;
+  - no `seq` gaps;
+  - one `boot_id` throughout;
+  - all records valid;
+  - zero late, aborted, overwritten and missing-slot counts;
+  - no watchdog resets.
+
+  *A 5-minute run cannot show events rarer than about 1 in 15,000 records.*
+- **V-2. Cadence [LA].** Over the V-1 run:
+  - every interval between bulk OUT packets is 20,000 µs ± 10 µs (USBH-T1);
+  - every SOF interval is 1000 µs ± 0.5 µs (C1-2);
+  - there is no SOF gap of 3 ms or more.
+
+  *Interim method:* the test target's cycle-counter timestamps. They include
+  its own interrupt latency, so their uncertainty shall be stated (expected
+  under 1 µs for SOF and a few µs for packet completion).
+- **V-3. Freshness and phase [LA].** In a diagnostic build, the XIAO drives D3
+  at the R-measurement trigger (M-20). Pass criterion: every packet
+  starts on the bus within 3 ms of that R measurement's end, taken as the
+  trigger plus the measured time from M-23 (USBH-T4). *Interim method:*
+  D3 is wired to the test target and timestamped on the same clock as the
+  packets.
+- **V-4. Core 0 timing.** At 120 MHz, from the diagnostic counters (D-4,
+  V-5 method):
+  - interrupt handlers and critical sections within EX-3 and EX-4;
+  - epoch work time below 1 ms;
+  - the magnetometer transaction within 450 µs of its tick (M-8). *[LA]
+    Interim method:* DWT timing in the I2C completion interrupt.
+- **V-5. Core 1 timing.** From the diagnostic counters:
+  - frame handler at most 300 µs (C1-3);
+  - publish to queued at most 50 µs (C1-4);
+  - the record published at least 50 µs before its SOF (USBH-T3).
+- **V-6. Enumeration.** 50 attach cycles. Pass criteria: each one streams
+  within 1 s of attach (USBH-3). With the never-ACK mode during
+  enumeration, the 2 s timeout fires and the failure is counted.
+
+### 9.3 Fault injection
+
+Each test passes if the stated counters change and records are as
+expected, and if streaming resumes where stated. The magnetometer schedule
+shall never be disturbed: no missed ticks and no timeouts.
+
+- **V-7. Hot-plug.** 100 detach/attach cycles. Each is counted, and each
+  restarts streaming with the stream-start flag set and `seq` continuing
+  (USBH-T8).
+- **V-8. Device stops reading.**
+  - **5 ms NAK burst:** the late counter increments; nothing is dropped.
+  - **50 ms NAK burst:** the stuck record is aborted after 20 ms, and the
+    newest record follows (USBH-T6).
+  - **5 s NAK:** aborts and overwrites are counted. The first record after
+    recovery is fresh.
+- **V-9. STALL.** On bulk OUT: the halt is cleared and streaming resumes.
+  With repeated STALLs, at most one clear per second. Same for bulk IN
+  (section 7.1). Also confirm that the data toggle resets: no record is
+  lost after a clear.
+- **V-10. Unsupported devices.** Each of these is counted as unsupported or
+  as an enumeration failure, and never sent data (USBH-9):
+  - 32-byte endpoints;
+  - not CDC;
+  - a low-speed device (any USB mouse);
+  - a hub.
+- **V-11. ACM variants.** No line-request support, and STALL on
+  SET_LINE_CODING. Both still stream (USBH-4).
+- **V-12. VBUS overcurrent.** Short VBUS through a resistor, staying within
+  the switch's rating. The overcurrent counter increments, the XIAO and
+  the magnetometer keep running, and streaming resumes when the short is
+  removed.
+- **V-13. Magnetometer faults.** DFC's V-6 cases: SDA short, sensor power
+  cycle and NACK, adapted to the 20 ms cycle. Records carry the right
+  reason codes, and valid records resume within 40 ms of a single hung
+  transaction (M-16a).
+- **V-14. Watchdog.** A diagnostic-build hook stalls core 1, and then
+  separately stalls core 0. A reset follows within the 1.5 s timeout. The
+  watchdog-reset count survives it, `boot_id` changes, and VBUS drops
+  during the reset.
+- **V-15. Detach detection (E9).** On every board used, an unplug is
+  detected within 100 ms in 20 of 20 trials (USBH-8). Confirm the SYSINFO
+  value that identifies A4, and that a non-A4 part sets `flags` bit 4
+  (HW-10).
+- **V-16. Dual-role (diagnostic builds).** Status output to a PC and V-1
+  streaming run together for 5 minutes, with V-1's pass criteria and no
+  corrupted status counters (USBH-S1a).
+
+### 9.4 Magnetometer bench checks (M-23)
+
+- **V-17. Measurement time.** Poll Meas_M_Done after triggers at BW = 00:
+  1,000 measurements, with minimum, typical and maximum recorded. Pass:
+  maximum at most 9.5 ms. Otherwise switch to the BW = 01 fallback.
+- **V-18. Noise: pair against single.** Alternate the two modes every
+  minute for 20 minutes at the VE-4 location:
+  - pair mode;
+  - one SET at start-up, then single BW = 00 measurements at 50 Hz.
+
+  Compute the RMS and Allan deviation of each axis for each mode. Report
+  which is lower, and whether SET/RESET repeatability (±1 mG) is visible.
+- **V-19. Mains cancellation.** Coil at 50 Hz, then at 60 Hz, then off. Report
+  the leakage relative to a reference measurement taken with the pair
+  spacing deliberately broken: one pair per cycle, but S and R 5 ms
+  apart, in a diagnostic build. Expected: 50 Hz strongly suppressed, and
+  60 Hz about 20 % leakage (M-21).
+- **V-20. Ground loop and supply.** Noise (as V-18) with the device
+  attached and detached (USBH-7a). Check the 3.3 V ripple and the CAP
+  voltage under the full measurement and pulse load, using a meter or
+  oscilloscope (M-23).
+
+### 9.5 Tools (Python, Windows)
+
+- `tools/rx_decode.py`: decodes the test target's UART stream, checks
+  COBS, CRC, `seq` and `boot_id`, and writes CSV.
+- `tools/timing_report.py`: interval histograms and pass/fail for
+  V-2 and V-3.
+- `tools/target_ctl.py`: selects the test-target modes (VE-2).
+- `tools/noise_report.py`: RMS and Allan deviation for V-18 and V-20.
