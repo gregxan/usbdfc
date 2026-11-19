@@ -338,7 +338,12 @@ whose SOF follows the record's publication.
     next frame, automatically (USBH-9).
   - **Newer records wait.** Until the delayed record is sent, newer records
     stay in the mailbox (IC-1), and only the newest survives.
-  - **Counted.** Late records and overwritten records are counted.
+  - **Stuck records are aborted.** If a record has not been accepted 20 ms
+    (one period) after it was queued, core 1 aborts the transfer, counts the
+    record as aborted, and queues the newest record from the mailbox. A
+    device that recovers therefore receives fresh data, never a stale
+    record. *(Verify that `hcd_pio_usb` supports TinyUSB's transfer abort.)*
+  - **Counted.** Late, aborted and overwritten records are counted.
 - **USBH-T7 (requirement on the downstream device).** The device shall accept
   one packet of up to 64 bytes per 20 ms period, continuously.
 - **USBH-T8. Start and restart.**
@@ -609,25 +614,118 @@ filter.
   shall be re-derived. *(TBD.)*
 - **Saturation (D-1).** The check applies to each raw S and R measurement.
 
-## 7. Diagnostics (new counters)
+## 7. Diagnostics and recovery
 
-- attach and detach events
-- enumeration failures and enumeration timeouts (USBH-3, USBH-9)
-- unsupported devices (USBH-9)
-- bytes received on bulk IN and discarded (USBH-4a)
-- transfer errors: CRC, timeout, babble, STALL
-- NAK-full events
-- dropped records
-- ring overflows
-- core 1 frame-handler duration maximum, and SOF interval minimum and
-  maximum (C1-2, C1-3)
-- maximum time from mailbox publish to queued (C1-4)
-- records overwritten in the mailbox (IC-1)
-- late records, and missing slots (USBH-T5, USBH-T6)
-- incomplete pairs (M-9)
-- core 1 SOF counter and loop heartbeat (cumulative; C1-7)
-- watchdog resets (kept across reset in watchdog scratch; C1-7)
-- VBUS overcurrent flag assertions (HW-12); chip stepping (HW-10)
+### 7.1 Recovery policy (D-5 replaced)
+
+No flag or counter triggers an automatic action, except the actions listed
+below.
+
+**Normal operation.** These are not recovery:
+
+- **Magnetometer (from DFC):**
+  - aborting a failed or timed-out transaction and resuming the schedule
+    (M-15, M-16);
+  - the I2C bus clear (M-18);
+  - re-probing at 5 Hz while the fault flag is set (M-2a);
+  - setting the fault flag on persistent not-ready measurements (M-2b).
+- **Enumeration retries.** TinyUSB repeats each failed enumeration step up
+  to 3 times, 100 ms apart (USBH-9).
+- **Transaction retries.** Pico-PIO-USB repeats an errored transaction up to
+  3 times, and a NAK'd one on every frame (USBH-9).
+- **New attach.** Enumeration on a new attach (USBH-9).
+- **Stuck records.** Aborting a record that is still not accepted after
+  20 ms, and moving on to the newest one (USBH-T6).
+- **Halted endpoints.**
+  - **Clear the halt.** When the device STALLs its bulk OUT or bulk IN
+    endpoint while streaming, the host sends CLEAR_FEATURE
+    (ENDPOINT_HALT), resets that endpoint's data toggle, and carries on
+    with the newest record.
+  - **Rate limit.** At most one halt clear per endpoint per second. A STALL
+    that occurs within a second of the last clear is counted and left until
+    the next second.
+  - *(Verify how TinyUSB `86ad6e5` and `hcd_pio_usb` reset the toggle.)*
+
+**Recovery.** The only automatic recovery action is the watchdog reset
+(C1-7).
+- **Every reset is counted** in watchdog scratch, which survives the reset.
+- **No limit.** There is no cap on watchdog resets in a row: the firmware
+  keeps resetting while the fault persists, and recovers by itself once it
+  clears.
+- **Visible.** A reset loop shows as changing `boot_id` values in the stream
+  (REC-4), and as the watchdog-reset count in diagnostic status.
+
+**Prohibited.** Everything else:
+- VBUS cycling;
+- host-initiated bus resets other than at a new attach;
+- re-enumerating a device that is still attached;
+- any software reset.
+
+**Counted, with no action:**
+- overcurrent (HW-12);
+- unsupported devices (USBH-9);
+- persistent transfer errors;
+- an unsupported chip stepping (HW-10).
+
+### 7.2 Counters (D-1 replaced)
+
+**Core 0 counters.** Cleared only by the main loop, with an atomic
+read-and-clear (D-2). The status reporter keeps totals since boot.
+
+- **Magnetometer:**
+  - I2C errors, missed ticks, timeouts;
+  - product-ID faults, bus clears, recoveries, run-time faults
+    (M-2a, M-2b);
+  - not-ready measurements, saturated measurements, incomplete pairs
+    (M-9).
+- **Scheduling:** tick overruns (M-6a), epoch overruns (EX-8).
+- **Hardware:** VBUS overcurrent assertions (HW-12).
+
+**Core 1 counters.** Cumulative and never cleared; core 0 reports the
+change between readings (IC-3).
+
+- **Device:**
+  - attaches, detaches;
+  - enumeration failures, enumeration timeouts;
+  - unsupported devices.
+- **Transfers:**
+  - transfer errors;
+  - STALLs on bulk OUT and on bulk IN;
+  - halt clears, and halt clears deferred by the rate limit.
+- **Records:**
+  - sent, late, aborted;
+  - overwritten in the mailbox (IC-1);
+  - missing slots (USBH-T5).
+- **Other:**
+  - bytes received on bulk IN and discarded (USBH-4a);
+  - the SOF counter and loop heartbeat (C1-7).
+
+**Timing maxima.** Reset only at boot.
+
+- **Core 1:** frame-handler duration (C1-3); SOF interval minimum and
+  maximum (C1-2); time from mailbox publish to queued (C1-4).
+- **Core 0:** epoch work time and start latency (D-4); interrupt-handler
+  and critical-section maxima (V-5); profiled sections (D-6). In diagnostic
+  builds only, the status reporter and `tud_task()` time (NU-3).
+
+**Persistent and static values:**
+- the watchdog-reset count, kept in watchdog scratch and cleared at
+  power-on (C1-7);
+- the chip stepping (HW-10);
+- the current `boot_id` (REC-4).
+
+**Removed from DFC:** all UART counters, offset calibrations (M-4b) and
+TX DMA completions (D-3a).
+
+### 7.3 Status format (diagnostic builds, NU-2)
+
+- **Rate.** Once per second, as a set of text lines.
+- **Lines.** Each line starts with a line type and the report's sequence
+  number, followed by `name=value` pairs for every counter, maximum and
+  value in section 7.2.
+- **Values.** Counter values are totals since boot.
+- **Never blocks.** A line is written only when it fits whole in the CDC
+  buffer.
 
 ## 8. Open decisions
 
@@ -656,9 +754,11 @@ filter.
    - SDK default VID/PID for now, with a Raspberry Pi PID required before
      distribution.
 5. Whether to extract the magnetometer driver into a module shared with DFC.
-6. D-5: which host retries, STALL clears and re-enumerations count as normal
-   operation. *(Partly closed: USBH-9 covers the TinyUSB and Pico-PIO-USB
-   retries, and C1-7 adds the watchdog-reset exception.)*
+6. *(Closed: section 7.)* Recovery and counters:
+   - halted endpoints are cleared, at most once per second;
+   - a stuck record is aborted after 20 ms;
+   - watchdog resets are unlimited and counted;
+   - the counter list and status format are consolidated.
 7. *(Closed: IC-1 to IC-3, section 4.1.)* Core 1 execution model:
    - a triple-buffer mailbox, which core 1 polls in a tight loop;
    - single-writer counters;
