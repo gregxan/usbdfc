@@ -7,7 +7,9 @@ document is final until the open decisions in section 8 are closed.
 
 Firmware for a Seeed XIAO RP2350 that:
 
-- Samples an MMC5983MA magnetometer on a fixed schedule.
+- Samples an MMC5983MA magnetometer on a fixed schedule and outputs one
+  offset-free reading every 20 ms (50 Hz), made from a SET/RESET pair of
+  low-noise (BW = 00) measurements.
 - Streams every output period's record to a downstream USB CDC device. The
   XIAO is the USB host, on a PIO-USB port.
 - Keeps output records evenly spaced: one per period, within a small
@@ -91,9 +93,10 @@ Firmware for a Seeed XIAO RP2350 that:
     measurement.)*
   - The thread may block only inside TinyUSB's own enumeration delays
     (USBH-3). It never blocks while streaming.
-- **C1-5. Phase.** Provisionally, the epoch runs at tick + 500 µs and SOF at
-  tick + 600 µs. The final values are set with the output period (D20),
-  after measurement.
+- **C1-5. Phase.** Epochs run every 1 ms at tick + 500 µs. SOF runs every
+  1 ms at tick + 600 µs. The record for each cycle is published in the epoch
+  of cycle tick 0 (M-20) and goes out on that tick's SOF. Both offsets are
+  provisional until measured.
 - **C1-6. Memory.** Core 1's stack is in SCRATCH_X, the SDK default for core 1.
   Its size is set from `-fstack-usage` (B-23). Pico-PIO-USB's and TinyUSB's
   host buffers go in SCRATCH_X if they fit, otherwise in main SRAM.
@@ -282,19 +285,49 @@ Firmware for a Seeed XIAO RP2350 that:
 
 ### 5.1 Output timing
 
-- **USBH-T1.** One record per output period. A bulk OUT shall start no later
-  than SOF + X µs. The interval from packet to packet shall be P ± 20 µs,
-  measured on the bus. P is 1 ms or 2 ms (section 8).
-- **USBH-T2.** SOF shall be generated from the magnetometer tick's timer grid,
-  at a fixed offset, each one scheduled from the previous target time.
-- **USBH-T3.** Core 0's epoch work shall finish before SOF minus a margin.
-- **USBH-T4.** Freshness: the age from trigger to bus shall be at most
-  1.5 ms. *TBD*.
-- **USBH-T5.** Every slot carries a record. An invalid or missing sample is
-  sent with its reason code and is never skipped.
-- **USBH-T6.** Every dropped record is counted.
+The output period is 20 ms (50 Hz): one record per magnetometer cycle (M-20).
+USB frames are 1 ms, so each record has one designated frame: the frame
+whose SOF follows the record's publication.
+
+- **USBH-T1. Cadence.** Each record's bulk OUT shall start within X µs of
+  its designated frame's SOF. *(X TBD by measurement, expected under
+  50 µs.)* The interval between consecutive records' packets shall be
+  20,000 µs ± 10 µs, measured on the bus. A record delayed by a NAK or an
+  error (USBH-T6) is exempt from this, but is counted as late.
+- **USBH-T2. SOF lock.** SOF shall be generated from the magnetometer tick's
+  timer grid, at a fixed offset (C1-5), each one scheduled from the previous
+  target time.
+- **USBH-T3. Publish margin.** Core 0 shall publish each record at least
+  50 µs before its designated SOF. *(TBD by measurement.)*
+- **USBH-T4. Freshness.** The time from the end of the record's second
+  (RESET) measurement to the start of its packet on the bus shall be at
+  most 3 ms. The record represents the field over the two 8 ms measurement
+  windows in M-20.
+- **USBH-T5. What is sent.** Every record core 0 publishes is sent. Invalid
+  records are sent with their reason code (M-9). If core 0 has published
+  nothing new by the designated frame, core 1 sends nothing for that
+  period. The device sees a gap in the sequence numbers, and core 1 counts
+  it as a missing slot.
+- **USBH-T6. Late records: newest wins.**
+  - **One at a time.** Core 1 queues at most one record with TinyUSB at a
+    time.
+  - **A NAK or error delays it.** Pico-PIO-USB retries the record on the
+    next frame, automatically (USBH-9).
+  - **Newer records wait.** Until the delayed record is sent, newer records
+    stay in the mailbox (IC-1), and only the newest survives.
+  - **Counted.** Late records and overwritten records are counted.
 - **USBH-T7 (requirement on the downstream device).** The device shall accept
-  one packet of up to 64 bytes in every output period, continuously.
+  one packet of up to 64 bytes per 20 ms period, continuously.
+- **USBH-T8. Start and restart.**
+  - **When the cadence applies.** USBH-T1 applies from the first record
+    sent after the device mounts. That record carries a stream-start flag.
+  - **Sequence numbers.** A record's sequence number is its cycle index
+    since boot (M-20). It keeps counting across a detach and re-attach, so
+    the device can see what it missed. A reboot restarts it from zero.
+  - **Boot identity.** Each record carries a boot identifier: the
+    watchdog-reset count (C1-7) plus a power-on count, *format TBD in the
+    record-format decisions (F)*. A reboot is therefore never mistaken for
+    a sequence wrap.
 
 ### 5.2 Record format
 
@@ -308,12 +341,66 @@ fields:
 
 ## 6. Magnetometer (amendments)
 
-- **M-6 / M-6a.** Keep the 1 kHz tick. At a 2 ms output period, sample on
-  even ticks and use the odd ticks for SET/RESET or a second measurement.
-- **M-4 / M-4b.** At a 2 ms period, consider SET/RESET differencing on every
-  sample: H = (S − R) / 2.
-- **M-8, M-16a, M-17.** Re-derive the deadlines and the staleness limit for
-  the chosen output period.
+The output is a SET/RESET pair of low-noise measurements every 20 ms. The XIAO
+schedules the pair and computes H = (S − R) / 2. It does no averaging or
+other filtering. Bandwidth limiting is left to the MMC5983MA's own BW = 00
+filter.
+
+- **M-3 (amended).** Internal Control 1: BW = 00, which is an 8 ms
+  measurement. All other register settings are unchanged. Auto_SR_en stays
+  off (M-3a), and so does continuous mode.
+- **M-20 (new). The 20 ms cycle.** The 1 kHz tick (M-6, M-6a) is kept as
+  the schedule grid. Every 20 ticks form one cycle (k = 0 … 19). Two
+  transactions run per cycle, both of DFC's read-then-trigger form (M-7)
+  with a pulse:
+  - **Tick 0:** read the previous cycle's RESET measurement, then SET
+    pulse, then trigger the SET measurement (S).
+  - **Tick 10:** read S, then RESET pulse, then trigger the RESET
+    measurement (R).
+
+  Other ticks start no transaction. They still run the M-16 timeout check.
+- **M-21 (new). Spacing.**
+  - **10 ms apart.** The S and R triggers are 10 ms apart, give or take the
+    tick jitter. RESET inverts the sensor's response to the whole field.
+    The two windows are half a 50 Hz period apart, so a 50 Hz field (and
+    its odd harmonics) cancels in S − R.
+  - **Margin.** Each measurement has 10 ms before it is read, against the
+    8 ms it takes.
+  - **60 Hz is not cancelled.** It aliases to 10 Hz. On a simple
+    flat-window estimate, about 20 % of it reaches the output after the
+    window and the pair.
+  - **No other filtering.** The XIAO applies none (scope decision).
+- **M-22 (new). The record.** Core 0 computes each record from the S and R
+  of one cycle:
+  - **Field:** H = (S − R) / 2 per axis, from the raw 18-bit counts. This
+    cancels the bridge offset and its temperature drift.
+  - **Offset (diagnostic):** O = (S + R) / 2 per axis, sent in the record.
+  - **Timestamp:** the S trigger time (M-10's definition). The record covers
+    the time from the S trigger to the R trigger plus 8 ms.
+  - **Sequence number:** the cycle index.
+  - **Valid:** true only if both S and R are valid.
+- **M-9 (amended). Reason codes.**
+  - **`AFTER_RESET` removed.** An R measurement is inverted by design and
+    is never marked invalid for that.
+  - **`PAIR_INCOMPLETE` added.** One half of the pair was lost to an abort
+    or timeout.
+  - **Order.** `NO_PRIOR`, then `NOT_READY` (checked on both halves), then
+    `PAIR_INCOMPLETE`.
+- **M-4 / M-4b (replaced by M-20 to M-22).**
+  - **Start-up.** Keep the single RESET → SET conditioning at start-up.
+  - **Removed.** The periodic SET/RESET strategy (`g_mag_sr_mode`) and the
+    periodic offset calibration, together with their counters (D-1).
+- **M-8 (amended).** Every transaction contains a pulse, so each shall
+  complete within 450 µs of its tick. This shall be re-measured at 120 MHz
+  (R-3).
+- **M-16a (amended).** After a single hung transaction, valid records shall
+  resume within 2 cycles (40 ms).
+- **M-17 (amended).** A record is stale once it is more than 30 ms old
+  (1.5 cycles).
+- **M-2b (amended).** The not-ready fault score now counts per measurement:
+  2 per cycle, instead of DFC's 1,000 per second. The default thresholds
+  shall be re-derived. *(TBD.)*
+- **Saturation (D-1).** The check applies to each raw S and R measurement.
 
 ## 7. Diagnostics (new counters)
 
@@ -330,6 +417,8 @@ fields:
   maximum (C1-2, C1-3)
 - maximum time from mailbox publish to queued (C1-4)
 - records overwritten in the mailbox (IC-1)
+- late records, and missing slots (USBH-T5, USBH-T6)
+- incomplete pairs (M-9)
 - core 1 SOF counter and loop heartbeat (cumulative; C1-7)
 - watchdog resets (kept across reset in watchdog scratch; C1-7)
 
@@ -340,8 +429,15 @@ fields:
    endpoints are 64 bytes. The host sets the line coding and DTR/RTS, polls
    IN and discards the data, and treats unsupported devices as counted and
    left alone. The specific product is still to be named.
-2. The output period: 1 ms or 2 ms. A 2 ms period also needs the per-sample
-   mode decided: single, averaged, or SET/RESET differenced.
+2. *(Closed: sections 5.1 and 6.)* Output timing and magnetometer mode:
+   - 50 Hz output (20 ms cycle);
+   - BW = 00;
+   - a SET/RESET pair sequenced by the XIAO, with the measurements 10 ms
+     apart and H = (S − R) / 2;
+   - no XIAO averaging or filtering;
+   - late records go out on the next frame, newest wins;
+   - a missing record is not replaced;
+   - bus tolerance ±10 µs.
 3. *(Closed: R-3, USBH-1, USBH-S1 to USBH-S5.)* The stack is TinyUSB host
    with `cdc_host` on Pico-PIO-USB `fe9133f`. `clk_sys` is 120 MHz, and
    D+/D- are on GPIO0/1. Accepting TinyUSB amended USBH-3, USBH-4, USBH-4a
