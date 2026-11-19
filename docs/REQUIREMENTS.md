@@ -308,53 +308,6 @@ Firmware for a Seeed XIAO RP2350 that:
   a written justification. The list is to be filled in after the first
   build and reviewed whenever USBH-S2 changes.
 
-### 5.3 Native USB (diagnostic builds only)
-
-- **NU-1. Builds.** The native USB device exists only in diagnostic presets
-  (B-7). Production presets have no device stack, no `USBCTRL_IRQ` and no
-  `tud_task()`. They are flashed from BOOTSEL entered with the BOOT button,
-  which the ROM's own USB handles without any firmware.
-- **NU-2. Content.**
-  - **What it sends.** Human-readable status lines, one set per second:
-    - every counter in section 7, including the watchdog-reset count;
-    - the timing maxima (C1-2 to C1-4, D-4, D-6);
-    - the fault flags;
-    - the latest record's validity and reason.
-  - **Never blocks.** A line is written only when the CDC buffer has room
-    for all of it, as DFC's status reporter does.
-  - **No data mirror.** The binary data records are not mirrored to this
-    port.
-- **NU-3. Timing on core 0.**
-  - **Interrupt.** `USBCTRL_IRQ` has the lowest priority (EX-5).
-  - **Task.** `tud_task()` and the status writer run once per epoch, after
-    the application work. Their time is excluded from the epoch measurement
-    and recorded as a separate maximum (D-4).
-  - **Bounds.** The native USB interrupt is bounded by EX-4.
-- **NU-4. Implementation.** `pico_stdio_usb` is not used, because it
-  supplies its own TinyUSB configuration and descriptors, which cannot also
-  enable the host. The project provides:
-  - its own `tusb_config.h` (USBH-S1);
-  - device descriptors;
-  - the CDC status writer, which calls `tud_cdc_write()` and uses no
-    `printf`.
-- **NU-5. Reboot into BOOTSEL without the button.**
-  - **Interfaces.** The device is composite: the CDC interface (with an
-    Interface Association Descriptor) plus the vendor reset interface
-    defined by the Pico SDK (`pico/usb_reset_interface.h`).
-  - **1200-baud touch.** Setting the line coding to 1,200 baud reboots into
-    BOOTSEL.
-  - **picotool.** Its reset requests (`picotool reboot -f`, `load -f`) work.
-  - **Before rebooting.** Firmware turns VBUS off (USBH-7), so the
-    downstream device sees a clean detach.
-- **NU-6. Identity.**
-  - **Development.** Diagnostic builds use the Pico SDK's default Raspberry
-    Pi VID/PID.
-  - **Strings.** The serial-number string is the RP2350 flash unique ID.
-    The product string identifies a usbdfc diagnostic build.
-  - **Release gate.** Before any units are distributed, a dedicated product
-    ID shall be obtained from Raspberry Pi, which offers them for RP2040 and
-    RP2350 products. NU-6 shall then be updated.
-
 ### 5.1 Output timing
 
 The output period is 20 ms (50 Hz): one record per magnetometer cycle (M-20).
@@ -445,6 +398,53 @@ whose SOF follows the record's publication.
   temperature-measurement time, and none is scheduled (M-23).
 - **REC-6. Compatibility.** A receiver shall ignore frames with an unknown
   `version` or `type`. A new field or meaning requires a new `version`.
+
+### 5.3 Native USB (diagnostic builds only)
+
+- **NU-1. Builds.** The native USB device exists only in diagnostic presets
+  (B-7). Production presets have no device stack, no `USBCTRL_IRQ` and no
+  `tud_task()`. They are flashed from BOOTSEL entered with the BOOT button,
+  which the ROM's own USB handles without any firmware.
+- **NU-2. Content.**
+  - **What it sends.** Human-readable status lines, one set per second:
+    - every counter in section 7, including the watchdog-reset count;
+    - the timing maxima (C1-2 to C1-4, D-4, D-6);
+    - the fault flags;
+    - the latest record's validity and reason.
+  - **Never blocks.** A line is written only when the CDC buffer has room
+    for all of it, as DFC's status reporter does.
+  - **No data mirror.** The binary data records are not mirrored to this
+    port.
+- **NU-3. Timing on core 0.**
+  - **Interrupt.** `USBCTRL_IRQ` has the lowest priority (EX-5).
+  - **Task.** `tud_task()` and the status writer run once per epoch, after
+    the application work. Their time is excluded from the epoch measurement
+    and recorded as a separate maximum (D-4).
+  - **Bounds.** The native USB interrupt is bounded by EX-4.
+- **NU-4. Implementation.** `pico_stdio_usb` is not used, because it
+  supplies its own TinyUSB configuration and descriptors, which cannot also
+  enable the host. The project provides:
+  - its own `tusb_config.h` (USBH-S1);
+  - device descriptors;
+  - the CDC status writer, which calls `tud_cdc_write()` and uses no
+    `printf`.
+- **NU-5. Reboot into BOOTSEL without the button.**
+  - **Interfaces.** The device is composite: the CDC interface (with an
+    Interface Association Descriptor) plus the vendor reset interface
+    defined by the Pico SDK (`pico/usb_reset_interface.h`).
+  - **1200-baud touch.** Setting the line coding to 1,200 baud reboots into
+    BOOTSEL.
+  - **picotool.** Its reset requests (`picotool reboot -f`, `load -f`) work.
+  - **Before rebooting.** Firmware turns VBUS off (USBH-7), so the
+    downstream device sees a clean detach.
+- **NU-6. Identity.**
+  - **Development.** Diagnostic builds use the Pico SDK's default Raspberry
+    Pi VID/PID.
+  - **Strings.** The serial-number string is the RP2350 flash unique ID.
+    The product string identifies a usbdfc diagnostic build.
+  - **Release gate.** Before any units are distributed, a dedicated product
+    ID shall be obtained from Raspberry Pi, which offers them for RP2040 and
+    RP2350 products. NU-6 shall then be updated.
 
 ## 6. Magnetometer (amendments)
 
